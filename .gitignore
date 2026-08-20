@@ -1,0 +1,56 @@
+# deps
+node_modules/
+.pnp.*
+.yarn/*
+
+# builds
+dist/
+build/
+.next/
+out/
+*.tsbuildinfo
+.turbo/
+
+# env
+.env
+.env.*
+!.env.example
+!.env.*.example
+
+# logs
+*.log
+npm-debug.log*
+pnpm-debug.log*
+logs/
+
+# test / coverage
+coverage/
+.nyc_output/
+playwright-report/
+test-results/
+
+# editors / os
+.DS_Store
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.example.json
+
+# local data
+/data/
+/tmp/
+*.sqlite
+*.db
+supabase/.branches/
+supabase/.temp/
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.ruff_cache/
+.pytest_cache/
+
+# claude local overrides
+.claude/settings.local.json

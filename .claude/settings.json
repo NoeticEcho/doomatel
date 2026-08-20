@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "enabledPlugins": {
+    "superpowers@superpowers-dev": true,
+    "example-skills@anthropic-agent-skills": true,
+    "llm-application-dev@claude-code-workflows": true,
+    "database-design@claude-code-workflows": true,
+    "backend-development@claude-code-workflows": true,
+    "frontend-mobile-development@claude-code-workflows": true,
+    "security-scanning@claude-code-workflows": true,
+    "agent-orchestration@claude-code-workflows": true
+  },
+  "extraKnownMarketplaces": {
+    "superpowers-dev": { "source": { "source": "github", "repo": "obra/superpowers" } },
+    "anthropic-agent-skills": { "source": { "source": "github", "repo": "anthropics/skills" } },
+    "claude-code-workflows": { "source": { "source": "github", "repo": "wshobson/agents" } }
+  },
+  "permissions": {
+    "allow": [
+      "Bash(pnpm:*)",
+      "Bash(npm run:*)",
+      "Bash(npx:*)",
+      "Bash(git status)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(docker compose:*)",
+      "Skill"
+    ]
+  }
+}
