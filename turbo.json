@@ -1,0 +1,45 @@
+{
+  "$schema": "https://turborepo.com/schema.json",
+  "ui": "stream",
+  "globalEnv": [
+    "NODE_ENV",
+    "DATABASE_URL",
+    "DIRECT_URL",
+    "SUPABASE_URL",
+    "SUPABASE_ANON_KEY",
+    "SUPABASE_SERVICE_ROLE_KEY",
+    "SUPABASE_JWT_SECRET",
+    "QDRANT_URL",
+    "QDRANT_API_KEY",
+    "REDIS_URL",
+    "S3_ENDPOINT",
+    "S3_BUCKET",
+    "S3_ACCESS_KEY_ID",
+    "S3_SECRET_ACCESS_KEY",
+    "LLM_BASE_URL",
+    "LLM_API_KEY",
+    "LLM_MODEL",
+    "LLM_MODEL_FAST",
+    "EMBEDDINGS_BASE_URL",
+    "EMBEDDINGS_API_KEY",
+    "EMBEDDINGS_MODEL",
+    "RERANKER_URL",
+    "COLLAB_URL",
+    "API_URL",
+    "NEXT_PUBLIC_API_URL",
+    "NEXT_PUBLIC_SUPABASE_URL",
+    "NEXT_PUBLIC_SUPABASE_ANON_KEY",
+    "NEXT_PUBLIC_COLLAB_URL"
+  ],
+  "tasks": {
+    "build": {
+      "dependsOn": ["^build"],
+      "outputs": ["dist/**", ".next/**", "!.next/cache/**"]
+    },
+    "dev": { "cache": false, "persistent": true },
+    "lint": { "dependsOn": ["^build"] },
+    "typecheck": { "dependsOn": ["^build"], "outputs": [] },
+    "test": { "dependsOn": ["^build"], "outputs": ["coverage/**"] },
+    "test:watch": { "cache": false, "persistent": true }
+  }
+}
