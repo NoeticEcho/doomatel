@@ -1,4 +1,4 @@
-import { createRequire } from 'node:module';
+import snowball from 'snowball-stemmers';
 
 /**
  * Лексический слой для русских правовых текстов.
@@ -12,8 +12,10 @@ import { createRequire } from 'node:module';
  * стемминг Snowball и разрежённые векторы BM25 для гибридного поиска Qdrant.
  */
 
-const require = createRequire(import.meta.url);
-const { newStemmer } = require('snowball-stemmers') as {
+// Пакет опубликован в формате CommonJS. Импорт по умолчанию работает
+// и в ESM-, и в CommonJS-сборке пакета; `createRequire(import.meta.url)`
+// в CommonJS-сборке недоступен, поэтому здесь его использовать нельзя.
+const { newStemmer } = snowball as unknown as {
   newStemmer: (language: string) => { stem: (word: string) => string };
 };
 

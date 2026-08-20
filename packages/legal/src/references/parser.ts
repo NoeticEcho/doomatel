@@ -18,6 +18,33 @@ export interface ExtractOptions {
 /** Максимальный «зазор» между звеньями цепочки: только пробелы и запятые. */
 const GAP_RE = /^[\s,]*$/u;
 
+/**
+ * Заголовок структурной единицы: «Статья 1. Предмет регулирования».
+ *
+ * Заголовок объявляет структуру документа, а не ссылается на неё, поэтому
+ * ссылкой не является. Без этой проверки разбор любого закона выдаёт по
+ * ложной ссылке на каждую статью, и настоящие ссылки тонут в шуме.
+ */
+const HEADING_RE =
+  /^(?:стать[яи]|глав[аы]|раздел|подраздел|часть|§|приложение)\s+[\dIVXLC][\d.\-–IVXLC]*\s*[.:]/iu;
+
+/** Начинается ли позиция с начала строки (допускаются пробелы). */
+function isAtLineStart(text: string, position: number): boolean {
+  for (let i = position - 1; i >= 0; i -= 1) {
+    const char = text[i];
+    if (char === '\n') return true;
+    if (char !== ' ' && char !== '\t') return false;
+  }
+  return true;
+}
+
+/** Является ли фрагмент заголовком структурной единицы, а не ссылкой. */
+function looksLikeHeading(text: string, start: number, end: number): boolean {
+  if (!isAtLineStart(text, start)) return false;
+  // Заголовок распознаётся вместе с последующей точкой или двоеточием.
+  return HEADING_RE.test(text.slice(start, Math.min(text.length, end + 2)));
+}
+
 function isAdjacent(text: string, from: number, to: number): boolean {
   if (to < from) return false;
   if (to - from > 3) return false;
@@ -102,6 +129,12 @@ export function extractReferences(text: string, options: ExtractOptions = {}): L
     const { chain, startsAt } = collectChainBefore(text, mentions, anchor.span[0], consumed);
     const ordered = normalizeChainOrder(chain);
     const paths = ordered.length > 0 ? expandChain(ordered, maxExpansion) : [[]];
+    // Ссылка «настоящий Федеральный закон» без указания структурной единицы
+    // и без известного акта не несёт сведений: она не адресует ни к чему.
+    if (anchor.isSelf && !options.selfAct && ordered.length === 0) {
+      continue;
+    }
+
     const ref = resolveAnchorRef(anchor, options.selfAct);
     const spanStart = chain.length > 0 ? startsAt : anchor.span[0];
     const raw = text.slice(spanStart, anchor.span[1]);
@@ -137,6 +170,14 @@ export function extractReferences(text: string, options: ExtractOptions = {}): L
   if (current.length > 0) internalChains.push(current);
 
   for (const chain of internalChains) {
+    // Заголовок статьи — не ссылка на неё.
+    if (
+      chain.length === 1 &&
+      looksLikeHeading(text, chain[0]!.span[0], chain[0]!.span[1])
+    ) {
+      continue;
+    }
+
     const ordered = normalizeChainOrder(chain);
     const paths = expandChain(ordered, maxExpansion);
     const start = chain[0]!.span[0];
