@@ -1,0 +1,30 @@
+{
+  "name": "@doomatel/collab",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsx watch src/main.ts",
+    "start": "node dist/main.js",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "lint": "eslint src test"
+  },
+  "dependencies": {
+    "@hocuspocus/extension-database": "^4.6.0",
+    "@hocuspocus/server": "^4.6.0",
+    "@doomatel/db": "workspace:*",
+    "jose": "^6.2.9",
+    "postgres": "^3.4.9",
+    "yjs": "^13.6.32"
+  },
+  "devDependencies": {
+    "@doomatel/tsconfig": "workspace:*",
+    "@types/node": "^22.19.1",
+    "tsup": "^8.5.1",
+    "tsx": "^4.23.12",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.11"
+  }
+}

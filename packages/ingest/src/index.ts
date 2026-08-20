@@ -9,3 +9,4 @@ export * from './pravo/client.js';
 export * from './sozd/bill-card.js';
 export * from './sozd/search.js';
 export * from './duma-api/reference-seed.js';
+export * from './duma-api/solutions.js';
