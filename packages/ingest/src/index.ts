@@ -8,3 +8,4 @@ export * from './duma-api/client.js';
 export * from './pravo/client.js';
 export * from './sozd/bill-card.js';
 export * from './sozd/search.js';
+export * from './duma-api/reference-seed.js';
