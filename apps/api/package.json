@@ -1,0 +1,45 @@
+{
+  "name": "@doomatel/api",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "build": "nest build",
+    "dev": "nest start --watch",
+    "start": "node dist/main.js",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "eslint src test"
+  },
+  "dependencies": {
+    "@doomatel/db": "workspace:*",
+    "@doomatel/ingest": "workspace:*",
+    "@doomatel/legal": "workspace:*",
+    "@doomatel/retrieval": "workspace:*",
+    "@nestjs/common": "^11.2.1",
+    "@nestjs/config": "^4.0.4",
+    "@nestjs/core": "^11.2.1",
+    "@nestjs/platform-express": "^11.2.1",
+    "@nestjs/swagger": "^11.4.7",
+    "@nestjs/terminus": "^11.1.1",
+    "@nestjs/throttler": "^6.5.0",
+    "@qdrant/js-client-rest": "^1.19.0",
+    "drizzle-orm": "^0.45.2",
+    "helmet": "^8.3.0",
+    "jose": "^6.2.9",
+    "postgres": "^3.4.9",
+    "reflect-metadata": "^0.2.2",
+    "rxjs": "^7.8.2",
+    "undici": "^8.10.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@doomatel/tsconfig": "workspace:*",
+    "@nestjs/cli": "^11.0.24",
+    "@nestjs/testing": "^11.2.1",
+    "@types/express": "^5.0.6",
+    "@types/node": "^22.19.1",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.11"
+  }
+}
