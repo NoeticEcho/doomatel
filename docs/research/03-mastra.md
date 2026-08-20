@@ -9,6 +9,23 @@
 
 ---
 
+> **Поправки по итогам реализации (2026-08-20), проверены компиляцией и тестами:**
+>
+> 1. Сигнатура `execute` у `createTool` — `(inputData, context) => …`,
+>    а не `({ context, requestContext }) => …`
+>    (`ToolExecuteFunction`, `dist/tools/types.d.ts:510`).
+> 2. Перечисление зарегистрированных объектов — `mastra.listAgents()` и
+>    `mastra.listWorkflows()`; методов `getAgents()` / `getWorkflows()` нет.
+> 3. Инструменты агента — `agent.listTools()`; описание — синхронный
+>    `agent.getDescription()`.
+>
+> **Поправка по конфигурации агента.** В `@mastra/core@1.60.0`
+> поля `defaultGenerateOptions` / `defaultStreamOptions` в `AgentConfigBase`
+> **отсутствуют**: есть `defaultOptions?: DynamicArgument<AgentExecutionOptions>`
+> (строка 618 в `dist/agent/types.d.ts`), а `defaultGenerateOptionsLegacy`
+> и `defaultStreamOptionsLegacy` оставлены для совместимости.
+> Проверено компиляцией; в коде используется `defaultOptions`.
+
 ## 0. TL;DR / решение
 
 | Вопрос | Ответ |
