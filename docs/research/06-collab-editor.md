@@ -1023,3 +1023,550 @@ function renderPopravkaWording(p: Popravka): string {
   }
 }
 ```
+
+---
+
+## 5. Экспорт: DOCX, PDF, шаблоны ПЗ и ФЭО
+
+### 5.1 Выбор инструмента
+
+| Подход | Пакет / версия | Лицензия | Вердикт |
+|---|---|---|---|
+| **Программная сборка DOCX** | **`docx` 9.7.1** | **MIT** | **ВЫБРАН** для всех нормативных документов |
+| Шаблоны + подстановка | `docxtemplater` 3.69.3 | MIT (core; модули `HTML`, `Table`, `Slides` — **платные**) | для бланков с фиксированной вёрсткой (титульные листы) |
+| BlockNote-экспортёр | `@blocknote/xl-docx-exporter` 0.54.0 | GPL-3.0 / коммерческая | ⛔ (внутри всё равно `docx`) |
+| Pandoc | внешний бинарь | GPL-2.0+ | как **отдельный процесс** GPL не «заражает» (нет линковки) — годится для конвертации входящих .doc/.rtf **на ингесте**, не для экспорта |
+| `html-to-docx` | 1.8.0, последняя публикация **2023-03-26** | MIT | ⛔ заброшен |
+| `prosemirror-docx` | 0.6.1 | MIT | референс маппинга PM→docx; своё лучше |
+| **PDF** | **LibreOffice headless** `soffice --headless --convert-to pdf` | MPL-2.0 | **ВЫБРАН**: PDF гарантированно совпадает с DOCX |
+| PDF (альтернатива) | `puppeteer` 25.8.0 | Apache-2.0 | только для HTML-отчётов/дашбордов, не для нормативных текстов |
+| PDF | `@blocknote/xl-pdf-exporter` 0.54.0 | GPL/платно | ⛔ |
+| PPTX | **`pptxgenjs` 4.0.1** | **MIT** | **ВЫБРАН** |
+
+> **Ключевое архитектурное решение по PDF: единственный источник истины — DOCX.**
+> Аппарат ГД работает в Word; если PDF рендерится независимым движком (Chromium), он неизбежно
+> разойдётся с DOCX по переносам, нумерации страниц и шрифтовым метрикам. Поэтому:
+> `PM JSON → docx (MIT) → .docx → LibreOffice → .pdf`. Один макет, две выдачи.
+> В Docker: `libreoffice-writer` + `fonts-liberation` + метрически совместимые с Times New Roman
+> кириллические шрифты (**PT Astra Serif** — стандарт де-факто для российских госорганов; лицензия
+> и допустимость дистрибуции в образе — **UNVERIFIED, требует юридической проверки**).
+
+### 5.2 `docx` 9.7.1 — что нам важно (VERIFIED из `dist/index.d.ts`)
+
+```ts
+// Многоуровневая нумерация
+export declare type INumberingOptions = {
+  readonly config: readonly { readonly levels: readonly ILevelsOptions[]; readonly reference: string }[]
+}
+export declare type ILevelsOptions = {
+  readonly level: number
+  readonly format?: 'decimal' | 'upperRoman' | 'lowerRoman' | 'upperLetter' | 'lowerLetter' | 'bullet' | …
+  readonly text?: string
+  readonly alignment?: …
+  readonly start?: number
+  readonly suffix?: 'nothing' | 'space' | 'tab'
+  readonly isLegalNumberingStyle?: boolean
+  readonly style?: { run?: IRunStylePropertiesOptions; paragraph?: ILevelParagraphStylePropertiesOptions; style?: string }
+}
+
+// Секции (страница, поля, колонтитулы)
+export declare type ISectionPropertiesOptionsBase = {
+  readonly page?: { size?: Partial<IPageSizeAttributes>; margin?: IPageMarginAttributes; pageNumbers?: …; borders?: …; textDirection?: … }
+  readonly titlePage?: boolean; readonly lineNumbers?: ILineNumberAttributes; …
+}
+
+// Вывод
+export declare class Packer {
+  static toBuffer(file, prettify?, overrides?): Promise<Buffer>
+  static toStream(file, prettify?, overrides?): Stream
+  static toBlob(file, …): Promise<Blob>
+  static toBase64String(file, …): Promise<string>
+}
+
+export declare const convertMillimetersToTwip: (millimeters: number) => number
+```
+
+**Нативные правки Word (отслеживание изменений) — поддерживаются (VERIFIED):**
+
+```ts
+export declare class InsertedTextRun extends XmlComponent { constructor(options: IInsertedRunOptions) }
+export declare class DeletedTextRun  extends XmlComponent { constructor(options: IDeletedRunOptions) }
+declare type IInsertedRunOptions = IChangedAttributesProperties & IRunOptions   // { id, author, date } + run
+declare type IDeletedRunOptions  = IRunOptions & IChangedAttributesProperties
+```
+и комментарии: `Comments`, `CommentRangeStart`, `CommentRangeEnd`, `CommentReference`, `CommentsExtended`
+(все в `ParagraphChild`).
+
+> **Это стратегически важно.** Наш `режим поправок` (§3) экспортируется в **настоящие Word-правки**:
+> `suggInsert` → `InsertedTextRun({ id, author, date })`, `suggDelete` → `DeletedTextRun(...)`,
+> наши комментарии → `CommentRangeStart/End` + `Comments`. Юрист аппарата ГД открывает .docx в Word,
+> видит привычный «режим рецензирования» и принимает/отклоняет правки штатными средствами.
+> Ни один другой рассмотренный вариант (BlockNote XL, Tiptap Conversion) этого не гарантирует.
+
+### 5.3 Маппер PM → DOCX для нормативного текста
+
+```ts
+// packages/legal-export/src/docx/legal.ts
+import {
+  Document, Packer, Paragraph, TextRun, InsertedTextRun, DeletedTextRun,
+  AlignmentType, LevelFormat, convertMillimetersToTwip, HeadingLevel,
+} from 'docx'
+
+// Стандарт оформления: А4, поля 20/10/20/20 мм, Times New Roman 14 pt, интервал 1,5.
+// (ГОСТ Р 7.0.97-2016 для ОРД; для законопроектов ГД — практика аппарата. UNVERIFIED, сверить с образцом.)
+const PAGE = {
+  size:   { width: convertMillimetersToTwip(210), height: convertMillimetersToTwip(297) },
+  margin: {
+    top: convertMillimetersToTwip(20), bottom: convertMillimetersToTwip(20),
+    left: convertMillimetersToTwip(30), right: convertMillimetersToTwip(15),
+  },
+}
+
+const STYLES = {
+  default: { document: { run: { font: 'Times New Roman', size: 28 /* half-points = 14pt */ },
+                         paragraph: { spacing: { line: 360 /* 1.5 */ }, indent: { firstLine: convertMillimetersToTwip(12.5) } } } },
+  paragraphStyles: [
+    { id: 'StatyaTitle', name: 'Статья (заголовок)', basedOn: 'Normal',
+      run: { bold: true }, paragraph: { spacing: { before: 240, after: 120 }, indent: { firstLine: convertMillimetersToTwip(12.5) } } },
+    { id: 'GlavaTitle', name: 'Глава', basedOn: 'Normal',
+      run: { bold: true, allCaps: true }, paragraph: { alignment: AlignmentType.CENTER, spacing: { before: 360, after: 240 }, indent: { firstLine: 0 } } },
+    { id: 'Abzac', name: 'Абзац', basedOn: 'Normal', paragraph: { alignment: AlignmentType.JUSTIFIED } },
+  ],
+}
+
+/**
+ * Номера НЕ отдаём Word-нумерации: пишем их текстом, вычисляя той же computeNumbering(),
+ * что и в редакторе. Причина — документ дальше редактируется людьми в Word: любая
+ * автонумерация там «поедет» при копипасте фрагментов между документами.
+ */
+export async function exportLegalDocx(doc: PMNode, opts: { showSuggestions: boolean; author: string }) {
+  const labels = new Map(computeNumbering(doc).map(l => [l.sid, l.label]))
+  const children: Paragraph[] = []
+
+  doc.descendants((node, pos) => {
+    switch (node.type.name) {
+      case 'glava':
+        children.push(new Paragraph({ style: 'GlavaTitle', text: `Глава ${labels.get(node.attrs.sid)}` }))
+        return true
+      case 'statyaTitle':
+        children.push(new Paragraph({
+          style: 'StatyaTitle',
+          children: [new TextRun({ text: `Статья ${labels.get(parentSid(node))}. `, bold: true }), ...runs(node, opts)],
+        }))
+        return false
+      case 'abzac': {
+        const prefix = labelPrefixFor(node, labels)          // '1. ' | '1) ' | 'а) ' | ''
+        children.push(new Paragraph({
+          style: 'Abzac',
+          children: [...(prefix ? [new TextRun(prefix)] : []), ...runs(node, opts)],
+        }))
+        return false
+      }
+    }
+    return true
+  })
+
+  const file = new Document({ styles: STYLES, sections: [{ properties: { page: PAGE }, children }] })
+  return Packer.toBuffer(file)
+}
+
+/** Инлайн-раны с сохранением режима поправок как настоящих правок Word. */
+function runs(node: PMNode, opts: { showSuggestions: boolean; author: string }) {
+  const out: any[] = []
+  node.forEach((child) => {
+    if (!child.isText) return
+    const ins = child.marks.find(m => m.type.name === 'suggInsert')
+    const del = child.marks.find(m => m.type.name === 'suggDelete')
+    const base = { text: child.text!, bold: hasMark(child, 'bold'), italics: hasMark(child, 'italic') }
+
+    if (opts.showSuggestions && ins)
+      out.push(new InsertedTextRun({ ...base, id: hash32(ins.attrs.id), author: ins.attrs.userId, date: ins.attrs.at }))
+    else if (opts.showSuggestions && del)
+      out.push(new DeletedTextRun({ ...base, id: hash32(del.attrs.id), author: del.attrs.userId, date: del.attrs.at }))
+    else if (del) { /* «чистовик»: удалённое не выводим */ }
+    else out.push(new TextRun(base))
+  })
+  return out
+}
+```
+
+### 5.4 Обязательный комплект документов при внесении законопроекта
+
+Определён **ст. 105 Регламента ГД** (VERIFIED, [base.garant.ru/1575717/…](https://base.garant.ru/1575717/41f30b66f51d8e9f5a28b7a545140739/),
+[Глава 12 Регламента](http://duma.gov.ru/duma/about/regulations/chapter-12/)):
+
+1. **Пояснительная записка** к законопроекту, содержащая предмет законодательного регулирования
+   и изложение концепции предлагаемого законопроекта, а также мотивированное обоснование
+   необходимости принятия или одобрения законопроекта;
+2. **текст законопроекта** с указанием на титульном листе субъекта права законодательной инициативы;
+3. **перечень законов РФ и иных нормативных правовых актов**, подлежащих признанию утратившими силу,
+   приостановлению, изменению или принятию в связи с принятием данного федерального закона;
+4. **финансово-экономическое обоснование** (если реализация потребует материальных затрат);
+5. **заключение Правительства РФ** (по законопроектам, предусмотренным ч. 3 ст. 104 Конституции РФ).
+
+Юридико-техническое оформление регулируется **«Методическими рекомендациями по юридико-техническому
+оформлению законопроектов»** (письмо Аппарата ГД ФС РФ от 18.11.2003 № вн2-18/490;
+существует обновлённая редакция, датировка — **UNVERIFIED**, надо взять актуальный текст с
+`pravo.gov.ru/metod/` изнутри РФ). Это первичный источник правил для нумерации, заголовков,
+формулировок «дополнить … следующего содержания», «изложить в следующей редакции», «признать утратившим силу».
+
+### 5.5 Шаблон пояснительной записки (структура генератора)
+
+Каждый раздел — отдельный узел документа `kind='poyasnitelnaya_zapiska'`, за каждым закреплён агент.
+
+```ts
+// packages/legal-export/src/templates/poyasnitelnaya-zapiska.ts
+export const PZ_SECTIONS = [
+  { key: 'header',      title: null,
+    tpl: 'ПОЯСНИТЕЛЬНАЯ ЗАПИСКА\nк проекту федерального закона\n«{{billTitle}}»' },
+
+  { key: 'predmet',     title: '1. Предмет законодательного регулирования',
+    agent: 'jurist',   required: true,  // прямое требование ст.105
+    hint: 'Какие общественные отношения регулирует проект; какие акты затрагивает.' },
+
+  { key: 'koncepciya',  title: '2. Концепция законопроекта',
+    agent: 'draftsman', required: true,  // прямое требование ст.105
+    hint: 'Основная идея, ключевые новеллы, механизм реализации.' },
+
+  { key: 'obosnovanie', title: '3. Обоснование необходимости принятия',
+    agent: 'analyst',  required: true,  // «мотивированное обоснование» — ст.105
+    hint: 'Проблема, статистика, правоприменительная практика, позиции судов, пробелы регулирования.' },
+
+  { key: 'sostoyanie',  title: '4. Состояние законодательства в данной сфере',
+    agent: 'jurist',   required: false,
+    hint: 'Действующие акты, история изменений, аналогичные законопроекты в СОЗД.' },
+
+  { key: 'posledstviya', title: '5. Прогноз социально-экономических и иных последствий',
+    agent: 'economist', required: false },
+
+  { key: 'sootvetstvie', title: '6. Соответствие Конституции РФ и международным договорам',
+    agent: 'jurist',   required: false },
+
+  { key: 'korrupciya',  title: '7. Оценка коррупциогенности',
+    agent: 'jurist',   required: false,
+    hint: 'ФЗ от 17.07.2009 № 172-ФЗ, методика Постановления Правительства РФ от 26.02.2010 № 96 (UNVERIFIED — сверить реквизиты).' },
+
+  { key: 'rashody',     title: '8. Влияние на расходы бюджетов бюджетной системы',
+    agent: 'economist', required: true,
+    hint: 'Если расходов нет — прямая формулировка «не потребует дополнительных расходов…», иначе → ФЭО.' },
+] as const
+```
+
+Каждый раздел, сгенерированный агентом, помечается как suggestion (§3.5) и требует акцепта человеком
+перед включением в финальный DOCX.
+
+### 5.6 Шаблон ФЭО
+
+```ts
+export const FEO_SECTIONS = [
+  { key: 'header', tpl: 'ФИНАНСОВО-ЭКОНОМИЧЕСКОЕ ОБОСНОВАНИЕ\nк проекту федерального закона\n«{{billTitle}}»' },
+  { key: 'vvod',      title: null, hint: 'Вводная: принятие … потребует / не потребует расходов, покрываемых за счёт …' },
+  { key: 'raskhody',  title: '1. Расходы федерального бюджета',  kind: 'table' },
+  { key: 'dohody',    title: '2. Влияние на доходы бюджетов',    kind: 'table' },
+  { key: 'raschety',  title: '3. Расчёты',                       kind: 'calc',
+    hint: 'Для каждой статьи расходов: формула, исходные показатели, источник данных (Росстат/Минфин/ЕМИСС).' },
+  { key: 'istochniki',title: '4. Источники финансирования' },
+  { key: 'vyvod',     title: '5. Вывод' },
+] as const
+```
+
+Табличные секции — числовая модель в Postgres, а не свободный текст:
+
+```sql
+create table feo_line (
+  id        uuid primary key default gen_random_uuid(),
+  doc_id    uuid not null references legal_doc(id) on delete cascade,
+  section   text not null check (section in ('raskhody','dohody')),
+  article   text not null,                      -- «Оплата труда», «Закупка ПО»
+  budget    text not null check (budget in ('federal','subject','municipal','extrabudget')),
+  y1_thous  numeric(18,2) not null default 0,   -- тыс. руб., первый год
+  y2_thous  numeric(18,2) not null default 0,
+  y3_thous  numeric(18,2) not null default 0,
+  formula   text,                                -- машиночитаемая формула
+  source    text,                                -- ссылка на источник исходных данных
+  ord       int not null default 0
+);
+```
+
+Это позволяет: (а) валидировать арифметику до экспорта; (б) агенту-экономисту править **строки**,
+а не текст; (в) генерировать таблицу в DOCX детерминированно (`docx` `Table`/`TableRow`/`TableCell`);
+(г) переиспользовать цифры в презентации (§6).
+
+### 5.7 Конвейер экспорта
+
+```
+PM JSON (из doc_version.pm_json или живого Y.Doc)
+      │
+      ├─ computeNumbering()        ── те же номера, что в UI
+      ├─ renderMode: 'clean' | 'redline' | 'suggestions-as-word-revisions'
+      ▼
+  packages/legal-export/docx/*.ts   (docx 9.7.1, MIT)
+      ▼
+   Buffer (.docx) ──► Supabase Storage (bucket `exports`, приватный)
+      │
+      └─► LibreOffice headless (sidecar-контейнер, unoserver)
+             soffice --headless --nologo --convert-to pdf:writer_pdf_Export --outdir /out in.docx
+             ▼
+          .pdf ──► Supabase Storage
+```
+
+> **Не запускать `soffice` в том же контейнере, что и Node API.** LibreOffice тяжёл (300+ МБ),
+> нестабилен при конкурентных запусках и требует своего профиля пользователя. Отдельный
+> sidecar `unoserver`/`gotenberg` с очередью — правильная форма. (Gotenberg — Docker-обёртка над
+> LibreOffice+Chromium, MIT; **UNVERIFIED** — версию и лицензию сверить перед внедрением.)
+
+---
+
+## 6. Презентации и тексты выступлений
+
+### 6.1 PPTX — `pptxgenjs` 4.0.1 (MIT, VERIFIED из `types/index.d.ts`)
+
+```ts
+class PptxGenJS {
+  defineLayout(layout: PresLayout): void            // { name, width, height } в дюймах
+  defineSlideMaster(props: SlideMasterProps): void
+  addSlide(props?: AddSlideProps): Slide            // { masterName?, sectionTitle? }
+  writeFile(props?: WriteFileProps): Promise<string>
+  stream(props?: WriteBaseProps): Promise<string | ArrayBuffer | Blob | Uint8Array>
+}
+interface Slide {
+  addText(text: string | TextProps[], options?: TextPropsOptions): Slide
+  addTable(rows: TableRow[], options?: TableProps): Slide
+  addNotes(notes: string): Slide                     // ← заметки докладчика
+}
+```
+
+Мастер-шаблон под фракцию/комитет:
+
+```ts
+// packages/legal-export/src/pptx/master.ts
+import PptxGenJS from 'pptxgenjs'
+
+export function createDeck(theme: FractionTheme) {
+  const pptx = new PptxGenJS()
+  pptx.layout = 'LAYOUT_16x9'                        // 10 × 5.625 in
+  pptx.defineSlideMaster({
+    title: 'DOOMATEL_MAIN',
+    background: { color: theme.bg },
+    objects: [
+      { rect: { x: 0, y: 5.15, w: '100%', h: 0.475, fill: { color: theme.accent } } },
+      { text: { text: theme.footer, options: { x: 0.4, y: 5.2, w: 7, h: 0.35, fontSize: 10, color: 'FFFFFF', fontFace: 'PT Astra Sans' } } },
+    ],
+    slideNumber: { x: 9.2, y: 5.2, fontSize: 10, color: 'FFFFFF' },
+  })
+  return pptx
+}
+```
+
+Генератор доклада по законопроекту (детерминированная структура, содержимое — от агентов):
+
+```ts
+export const BILL_DECK_SLIDES = [
+  { key: 'title',      layout: 'title',   from: 'bill.title + author + reading' },
+  { key: 'problema',   layout: 'bullets', from: 'pz.obosnovanie',   maxBullets: 4 },
+  { key: 'suschnost',  layout: 'bullets', from: 'pz.koncepciya',    maxBullets: 5 },
+  { key: 'izmeneniya', layout: 'table',   from: 'diff:было/стало',  maxRows: 6 },
+  { key: 'finansy',    layout: 'table',   from: 'feo_line',         maxRows: 6 },
+  { key: 'pozicii',    layout: 'bullets', from: 'zaklyucheniya (Правительство, ПУ, комитеты-соисполнители)' },
+  { key: 'prosba',     layout: 'callout', from: 'проект решения: «принять в первом чтении»' },
+] as const
+```
+
+Заметки докладчика (`slide.addNotes(...)`) заполняются соответствующим абзацем текста выступления —
+так один артефакт закрывает и слайды, и суфлёр.
+
+### 6.2 Тексты выступлений
+
+Доклад субъекта права законодательной инициативы и содоклад ответственного комитета —
+процедура гл. 13 Регламента ГД. **Регламентное время выступления устанавливается решением
+палаты и на практике составляет единицы минут — точные значения UNVERIFIED, требуют сверки
+со стенограммами (доступны через `transcript`-источники, см. `01-sozd-data-sources.md`).**
+
+Практический бюджет текста (расчёт, не норма): формальная русская речь с листа —
+**~110–130 слов/мин**. Отсюда:
+
+| Формат | Время | Слов | Знаков с пробелами |
+|---|---|---|---|
+| Доклад по законопроекту (I чтение) | 5 мин | 550–650 | ~4 200 |
+| Содоклад комитета | 3 мин | 330–390 | ~2 500 |
+| Выступление по мотивам голосования | 1 мин | 110–130 | ~850 |
+| Вопрос докладчику | 30 с | 55–65 | ~430 |
+| Выступление на «правительственном часе» | 7 мин | 770–910 | ~5 900 |
+
+Генератор:
+
+```ts
+// packages/agents/src/speech/generate.ts
+export const speechWorkflow = createWorkflow({ id: 'speech' })
+  .then(collectContext)   // законопроект + ПЗ + ФЭО + заключения + позиция фракции + стенограммы похожих
+  .then(outline)          // тезисы под жёсткий бюджет слов
+  .then(draft)            // связный текст; правило: одно предложение ≤ 25 слов (читаемость с листа)
+  .then(qaBlock)          // блок «вероятные вопросы и ответы» — отдельный артефакт
+  .then(fitToBudget)      // итеративное сжатие до targetWords ± 5%
+  .commit()
+
+export const SPEECH_STRUCTURE = [
+  'Обращение («Уважаемый Председатель, уважаемые депутаты!»)',
+  'Предмет: что за законопроект, кто внёс, какое чтение',
+  'Проблема: 1–2 факта с источником',
+  'Суть предлагаемых изменений: 2–4 пункта',
+  'Финансовые последствия (из ФЭО)',
+  'Позиции: Правительство, ПУ Аппарата ГД, комитеты-соисполнители',
+  'Просьба к палате (проект решения)',
+]
+```
+
+**Обязательное требование к генерации:** каждый фактический тезис несёт ссылку на источник
+(норма закона / строка ФЭО / заключение). Тезисы без источника помечаются и не попадают в чистовик —
+тот же принцип cite-or-abstain, что в `04-retrieval.md`.
+
+Экспорт выступления — DOCX, но с другими стилями: 16 pt, интервал 2.0, поля шире, разбивка на
+абзацы по смысловым паузам, номера страниц крупно. Это «текст для трибуны», не документ.
+
+---
+
+## 7. Итоговый манифест зависимостей
+
+```jsonc
+// packages/legal-editor/package.json  (клиент)
+{
+  "dependencies": {
+    "@tiptap/core": "3.30.2",
+    "@tiptap/pm": "3.30.2",
+    "@tiptap/react": "3.30.2",
+    "@tiptap/starter-kit": "3.30.2",
+    "@tiptap/extension-collaboration": "3.30.2",
+    "@tiptap/extension-collaboration-caret": "3.30.2",
+    "@tiptap/y-tiptap": "3.0.9",
+    "yjs": "13.6.32",
+    "y-protocols": "1.0.7",
+    "y-indexeddb": "9.0.12",
+    "@hocuspocus/provider": "4.6.0",
+    "prosemirror-changeset": "2.4.1"
+  }
+}
+// apps/collab/package.json  (сервер)
+{
+  "dependencies": {
+    "@hocuspocus/server": "4.6.0",
+    "@hocuspocus/extension-database": "4.6.0",
+    "@hocuspocus/extension-redis": "4.6.0",
+    "@hocuspocus/extension-logger": "4.6.0",
+    "yjs": "13.6.32",
+    "y-protocols": "1.0.7",
+    "y-prosemirror": "1.3.7",
+    "jose": "^6",
+    "pg": "^8"
+  }
+}
+// packages/legal-export/package.json
+{
+  "dependencies": { "docx": "9.7.1", "pptxgenjs": "4.0.1", "docxtemplater": "3.69.3", "pizzip": "^3" }
+}
+```
+
+**Все лицензии: MIT / Apache-2.0 / MPL-2.0. Copyleft-зависимостей (GPL/AGPL) в бандле нет.
+Платных подписок нет. Совокупная лицензионная стоимость — 0 ₽/год.**
+
+Сравнение с альтернативами (в год, при курсе для оценки порядка величины):
+
+| Вариант | Прямые лицензионные платежи | Данные вне РФ | Приватный npm-реестр в CI |
+|---|---|---|---|
+| **Рекомендованный (Tiptap MIT + Hocuspocus)** | **0** | нет | нет |
+| BlockNote с XL | **$2 340/год** (Business) | нет | нет |
+| Tiptap Team + Tracked Changes add-on | **≥ $2 148/год** + custom за track changes | **да** (Cloud), нет только в Enterprise | **да** |
+| Tiptap Enterprise (on-prem) | custom, ориентир — пятизначный $ | нет | да |
+
+---
+
+## 8. Риски и открытые вопросы
+
+### Риски
+
+1. **Track changes пишем сами.** Это 3–6 недель работы сильного инженера по ProseMirror плюс
+   долгий хвост крайних случаев (таблицы, вложенные списки, одновременные правки одного диапазона
+   двумя авторами). Митигация: начать с адаптации `@handlewithcare/prosemirror-suggest-changes` (MIT),
+   не с нуля; заморозить набор поддерживаемых операций в MVP (текст + структурные вставки/удаления,
+   без перемещений).
+2. **Перемещение блоков в CRDT.** Yjs не имеет операции «move»; перенос статьи = delete + insert,
+   что в диффе выглядит как «удалили и добавили». Для таблицы поправок это неверно юридически.
+   Митигация: `sid` сохраняется при drag-and-drop → детектор `kind: 'moved'` в структурном диффе (§4.3).
+   **Требует явной реализации, из коробки не работает.**
+3. **`ychange`-дифф ≠ юридический дифф.** Два механизма (§4.2 и §4.3) должны давать
+   непротиворечивую картину, иначе пользователь потеряет доверие. Нужен явный UX-разделитель:
+   «Сравнить редакции» (визуально) vs «Таблица поправок» (юридически).
+4. **Размер Y.Doc для кодексов.** Налоговый/Уголовный кодекс — мегабайты текста. Initial sync,
+   память Hocuspocus и время `mergeUpdatesV2` при компакции надо мерить.
+   Митигация: один Y.Doc на **главу/раздел**, а не на кодекс целиком; документ-оглавление ссылается на части.
+5. **`@blocknote/core` peer-депендится на `@y/y ^14.0.0-rc.23` и `@y/prosemirror ^2.0.0-6`**
+   (optional, VERIFIED из `package.json@0.54.0`). Если решим брать BlockNote — следить, чтобы pnpm
+   не подтянул Yjs v14 RC рядом с v13, который нужен Hocuspocus 4. Две копии Yjs в бандле = молчаливая порча данных.
+6. **Hocuspocus 4 — свежий мажор** (релиз 2026-04-23, миграция на `crossws`, смена рантайм-абстракции).
+   Митигация: закрепить точную версию, прогнать нагрузочный тест на 50 одновременных редакторов
+   до принятия архитектурного решения.
+7. **LibreOffice в контуре.** Версия LibreOffice влияет на вёрстку PDF. Закрепить версию образа,
+   держать golden-файлы для regression-тестов вёрстки.
+8. **Шрифты.** Times New Roman — проприетарный шрифт Monotype; распространять в Docker-образе нельзя.
+   PT Astra Serif — надо проверить условия. Иначе Liberation Serif (метрически совместим, OFL/GPL+FE).
+
+### Открытые вопросы
+
+1. **Точная форма бланка таблицы поправок ГД** — нужен реальный образец (.doc) из СОЗД по любому
+   законопроекту второго чтения. Из этой среды СОЗД недоступен; собрать изнутри РФ.
+2. **Актуальная редакция «Методических рекомендаций по юридико-техническому оформлению законопроектов»** —
+   есть обновление после 2003 г., точные реквизиты не подтверждены. Взять с `pravo.gov.ru/metod/`.
+3. **Регламентные лимиты времени выступлений** — вычислить эмпирически из стенограмм, а не из нормы.
+4. **Правила буквенной нумерации подпунктов** (какие буквы русского алфавита пропускаются:
+   ё, й, ъ, ы, ь) — подтвердить по Методическим рекомендациям.
+5. **Нужен ли BlockNote вообще** — решается одним прототипом: собрать Notion-подобный блочный UI
+   на голом Tiptap v3 за неделю; если получается — BlockNote не нужен ни в каком виде.
+6. **Требования ФСТЭК/аттестация** к контуру — влияет на то, можно ли вообще использовать
+   Redis/Postgres в выбранной топологии и нужен ли отечественный дистрибутив Postgres (Postgres Pro).
+7. **Импорт .doc/.rtf** действующих законов в редактор — Pandoc/LibreOffice как отдельный процесс
+   (лицензионно чисто), но качество маппинга в нашу строгую схему надо проверять на реальных файлах.
+
+---
+
+## 9. Порядок реализации
+
+| Спринт | Результат |
+|---|---|
+| 1 | PM-схема нормативного текста + `computeNumbering()` + плагин декораций; юнит-тесты нумерации на 5 реальных законах |
+| 2 | `apps/collab`: Hocuspocus + JWT `onAuthenticate` + Postgres `Database` + `doc_update`/компакция; нагрузочный тест |
+| 3 | Клиент: Tiptap + Collaboration + Caret + IndexedDB; presence-UI; ACL read/comment/suggest/edit |
+| 4–5 | Режим поправок: марки, атрибуты узлов, accept/reject, батчи; экспорт в Word-revisions |
+| 6 | Редакции `doc_version` + сравнение через `ychange` + структурный дифф `prosemirror-changeset` |
+| 7 | `popravka` + материализация из батчей + валидатор ст. 120 + генерация таблиц № 1–4 в DOCX |
+| 8 | Экспорт: законопроект, ПЗ, ФЭО (табличная модель), перечень актов; PDF через LibreOffice |
+| 9 | Комментарии/треды; интеграция AI-агентов строго через режим поправок |
+| 10 | PPTX + генератор выступлений с бюджетом слов и cite-or-abstain |
+
+---
+
+## Источники
+
+- [tiptap.dev/pricing](https://tiptap.dev/pricing) — тарифы Tiptap Platform, Tracked Changes как add-on, on-prem только в Enterprise
+- [tiptap.dev/docs/hocuspocus/server/hooks](https://tiptap.dev/docs/hocuspocus/server/hooks) — `onAuthenticate`, `connection.readOnly`, `onChange`
+- [tiptap.dev/docs/hocuspocus/server/extensions/database](https://tiptap.dev/docs/hocuspocus/server/extensions/database) — `fetch`/`store`
+- [github.com/ueberdosis/hocuspocus/blob/main/CHANGELOG.md](https://github.com/ueberdosis/hocuspocus/blob/main/CHANGELOG.md) — breaking changes v4
+- [blocknotejs.org/pricing](https://www.blocknotejs.org/pricing) — Business $195/мес, коммерческая лицензия XL
+- [blocknotejs.org/legal/blocknote-xl-commercial-license](https://www.blocknotejs.org/legal/blocknote-xl-commercial-license)
+- [github.com/TypeCellOS/BlockNote](https://github.com/TypeCellOS/BlockNote) — «XL packages … licensed under the GPL-3.0»
+- [github.com/TypeCellOS/BlockNote/issues/1464](https://github.com/TypeCellOS/BlockNote/issues/1464) — diff/track-changes ещё не реализованы
+- [blocknotejs.org/docs/features/collaboration/comments](https://www.blocknotejs.org/docs/features/collaboration/comments) — `ThreadStore`, `YjsThreadStore`
+- [github.com/handlewithcarecollective/prosemirror-suggest-changes](https://github.com/handlewithcarecollective/prosemirror-suggest-changes) — MIT
+- [github.com/davefowler/prosemirror-suggestion-mode](https://github.com/davefowler/prosemirror-suggestion-mode) — MIT
+- [platejs.org/docs/suggestion](https://platejs.org/docs/suggestion), [platejs.org/docs/yjs](https://platejs.org/docs/yjs)
+- [github.com/yjs/y-prosemirror](https://github.com/yjs/y-prosemirror) + прочитанные исходники `src/plugins/sync-plugin.js@1.3.7`
+- [docs.yjs.dev/ecosystem/editor-bindings/prosemirror](https://docs.yjs.dev/ecosystem/editor-bindings/prosemirror)
+- [supabase.com/docs/guides/realtime/limits](https://supabase.com/docs/guides/realtime/limits) — лимит сообщения 256 КБ
+- [github.com/AlexDunmow/y-supabase](https://github.com/AlexDunmow/y-supabase) — alpha, заброшен
+- [github.com/yjs/yhub](https://github.com/yjs/yhub), [github.com/MaxNoetzold/y-postgresql](https://github.com/MaxNoetzold/y-postgresql)
+- [Регламент ГД, глава 12](http://duma.gov.ru/duma/about/regulations/chapter-12/) и [глава 13](http://duma.gov.ru/duma/about/regulations/chapter-13/)
+- [ст. 105 Регламента ГД (ГАРАНТ)](https://base.garant.ru/1575717/41f30b66f51d8e9f5a28b7a545140739/) — комплект документов
+- [ст. 120 Регламента ГД (ГАРАНТ)](https://base.garant.ru/1575717/cc073c9cb88a9742ae933f9f008c13bb/) — три вида поправок
+- [Методические рекомендации по юридико-техническому оформлению законопроектов (ГАРАНТ)](https://base.garant.ru/12134002/)
+- Прямые проверки: `npm view <pkg> version license` и распаковка тарболлов `docx@9.7.1`, `pptxgenjs@4.0.1`,
+  `yjs@13.6.32`, `y-prosemirror@1.3.7`, `@tiptap/y-tiptap@3.0.9`, `@hocuspocus/server@4.6.0`,
+  `@hocuspocus/extension-database@4.6.0`, `prosemirror-changeset@2.4.1`, `@blocknote/core@0.54.0`,
+  `y-indexeddb@9.0.12`, `y-websocket@3.1.0` — 2026-08-20

@@ -476,8 +476,10 @@ begin
   -- пути 3 и 4: делегирование целой организации или рабочей группе.
   -- ЭТО И ЕСТЬ МЕЖПАРТИЙНЫЙ ДОСТУП. Срок действия проверяется здесь,
   -- а не в политике, — иначе просроченная выдача осталась бы рабочей.
-  select app.role_max(v_role, min_by.role) into v_role
-  from (
+  -- ВНИМАНИЕ: скалярный подзапрос, а НЕ `select ... into v_role from (...)`.
+  -- Форма с FROM обнулила бы v_role, если выдач нет (SELECT INTO без строк даёт NULL),
+  -- стерев роль, полученную по путям 2 и 5.
+  v_role := app.role_max(v_role, (
     select ps.role
     from public.project_share ps
     where ps.project_id = p_project
@@ -488,7 +490,7 @@ begin
       )
     order by app.role_rank(ps.role)
     limit 1
-  ) as min_by;
+  ));
 
   return v_role;
 end;
@@ -835,8 +837,8 @@ begin
   end if;
 
   -- 3. точечные выдачи
-  select app.role_max(v_role, g.role) into v_role
-  from (
+  -- скалярный подзапрос — см. примечание в app.project_role
+  v_role := app.role_max(v_role, (
     select a.role from public.draft_acl a
     where a.draft_id = p_draft
       and a.effect = 'grant'
@@ -846,7 +848,7 @@ begin
            or a.workgroup_id    = any (v_wgs))
     order by app.role_rank(a.role)
     limit 1
-  ) g;
+  ));
 
   -- владелец документа не теряет доступ никогда
   if v_d.created_by = v_uid then
@@ -1455,3 +1457,708 @@ Note `packages/db` uses the `postgres` (postgres.js) driver `[V-npm] postgres@3.
 For the `asUser` pattern above either driver works; `postgres.js` uses `reserve()` instead
 of `pool.connect()`. Pick one and keep it — `pg@8.23.0` `[V-npm]` has the more predictable
 pooling story under Supavisor.
+
+---
+
+## 5. Realtime: Supabase Realtime vs a Nest socket.io gateway
+
+### 5.1 The three Realtime mechanisms, and which to use
+
+| Mechanism | How it works | Use in Doomatel |
+|---|---|---|
+| `postgres_changes` | Realtime reads the WAL, then **re-checks RLS per subscriber per change**. Cost grows with subscriber count. | **No.** Deprecated in practice for chat-scale fan-out. |
+| **`broadcast`** | Pub/sub over a topic. Can be emitted **from SQL** via `realtime.broadcast_changes()` / `realtime.send()` in a trigger. Authorised by RLS on `realtime.messages`. | **Yes — the primary transport** for chat, presence hints, agent-run progress. |
+| **`presence`** | Per-channel ephemeral state (who is online / typing / cursor). Same authorisation model. | **Yes** — presence and the collaborative-editor cursor layer. |
+
+Verified API `[V-doc]` https://supabase.com/docs/guides/realtime/broadcast :
+
+```sql
+PERFORM realtime.broadcast_changes(
+  'conversation:' || NEW.conversation_id::text,  -- topic
+  TG_OP,                                          -- event
+  TG_OP,                                          -- operation
+  TG_TABLE_NAME, TG_TABLE_SCHEMA,                 -- table, schema
+  NEW, OLD                                        -- new record, old record
+);
+
+-- произвольная полезная нагрузка
+SELECT realtime.send('{}'::jsonb, 'event', 'topic', TRUE /* private */);
+```
+
+Authorisation `[V-doc]` https://supabase.com/docs/guides/realtime/authorization :
+create RLS policies on **`realtime.messages`**; subscribe with `config: { private: true }`;
+call `supabase.realtime.setAuth()` on the client. Realtime connects as
+`supabase_admin`, then **inserts the message and reads it back inside a transaction it
+rolls back**, purely to evaluate the user's policies — the probe message is never
+delivered. `realtime.topic()` returns the channel topic inside a policy.
+
+### 5.2 Verdict for chat: Supabase Realtime, not a Nest socket.io gateway
+
+| | Supabase Realtime | Nest + socket.io |
+|---|---|---|
+| Horizontal scale | Elixir/Phoenix, built for this; clustering included | Needs `@socket.io/redis-adapter` + sticky sessions |
+| Authorisation | **Same RLS policies as the REST path** — one model | A second, hand-written model that will drift |
+| Presence CRDT | Built in | Hand-rolled |
+| DB→client fan-out | `realtime.broadcast_changes()` in a trigger — the message is delivered *because it committed* | App must publish after commit; a crash between commit and publish silently loses the event |
+| Ops cost | One more container we already run | One more scaling axis on the Nest fleet |
+
+The third row is decisive. Emitting from a trigger makes delivery **transactional**:
+there is no window where the row exists and the notification does not.
+
+**Where socket.io still wins, and where we should keep it:** the **collaborative editor**
+(`draft.yjs_state` / `draft_yjs_update` in `collaboration.ts`) needs a Yjs-aware server
+that applies and compacts binary updates — Realtime's broadcast is a dumb pipe and would
+push per-keystroke traffic through Postgres. Run a **dedicated `apps/collab` y-websocket
+service** (hinted at in `infra/docker-compose.yml`'s comment about a `collab` app) and keep
+Realtime for everything else. Two transports, cleanly separated by purpose, not by accident.
+
+### 5.3 Chat schema — additions to `collaboration.ts`
+
+`collaboration.ts` already has `conversation`, `conversation_participant`, `message`,
+`message_reaction`. Three things are missing for a production chat:
+
+```sql
+-- ============================================================================
+-- 0003_chat.sql
+-- ============================================================================
+
+-- 1. Вложения. Сейчас файлы висят на project через asset; сообщению нужна связь.
+create table public.message_attachment (
+  message_id uuid not null references public.message(id) on delete cascade,
+  asset_id   uuid not null references public.asset(id)   on delete cascade,
+  ordinal    int  not null default 0,
+  primary key (message_id, asset_id)
+);
+create index message_attachment_asset_idx on public.message_attachment(asset_id);
+
+-- 2. Ветки. reply_to_id даёт дерево, но «показать все ответы в ветке» — это
+--    рекурсивный обход. Денормализуем корень ветки.
+alter table public.message
+  add column if not exists thread_root_id uuid references public.message(id) on delete cascade,
+  add column if not exists reply_count int not null default 0;
+create index if not exists message_thread_idx
+  on public.message(thread_root_id, created_at)
+  where thread_root_id is not null;
+
+-- 3. Точные отметки о прочтении.
+--    conversation_participant.last_read_message_id хватает для счётчика непрочитанного,
+--    но не отвечает на вопрос «кто прочитал ЭТО сообщение» (нужно для поручений).
+create table public.message_read (
+  message_id uuid not null references public.message(id) on delete cascade,
+  user_id    uuid not null references public.profile(id) on delete cascade,
+  read_at    timestamptz not null default now(),
+  primary key (message_id, user_id)
+);
+create index message_read_user_idx on public.message_read(user_id, read_at);
+```
+
+> **Sizing warning.** `message_read` is O(messages × participants). For an организация-wide
+> channel that is unacceptable. **Rule: write `message_read` rows only for conversations
+> with `kind IN ('direct','group')` and ≤ 50 participants; rely on
+> `conversation_participant.last_read_message_id` otherwise.** Enforce in a trigger, not in
+> application code. `[UNVERIFIED — design proposal]`
+
+### 5.4 Chat RLS
+
+One helper, then everything hangs off it:
+
+```sql
+create or replace function app.conversation_ids(p_uid uuid default null)
+returns uuid[]
+language plpgsql stable security definer set search_path = ''
+as $$
+declare
+  v_uid uuid := app.assert_self(p_uid);
+  v_ids uuid[];
+begin
+  if v_uid is null then return '{}'::uuid[]; end if;
+  select array_agg(distinct c.id) into v_ids
+  from public.conversation c
+  where
+    -- прямое участие
+    exists (select 1 from public.conversation_participant cp
+             where cp.conversation_id = c.id
+               and cp.user_id = v_uid
+               and cp.left_at is null)
+    -- чат проекта доступен всем, кто видит проект (включая депутатов других партий)
+    or (c.kind = 'project'   and c.project_id      = any (app.visible_project_ids(v_uid)))
+    or (c.kind = 'workgroup' and c.workgroup_id    = any (app.user_workgroup_ids(v_uid)))
+    or (c.kind = 'organization' and c.organization_id = any (app.user_org_scope(v_uid)));
+  return coalesce(v_ids, '{}'::uuid[]);
+end;
+$$;
+```
+
+```sql
+create policy conversation_select on public.conversation
+for select to authenticated
+using ( id = any ((select app.conversation_ids())) );
+
+create policy conversation_participant_select on public.conversation_participant
+for select to authenticated
+using ( conversation_id = any ((select app.conversation_ids())) );
+
+-- выйти из беседы может каждый сам; добавлять других — создатель беседы
+create policy conversation_participant_self on public.conversation_participant
+for update to authenticated
+using ( user_id = (select auth.uid()) )
+with check ( user_id = (select auth.uid()) );
+
+create policy message_select on public.message
+for select to authenticated
+using (
+  conversation_id = any ((select app.conversation_ids()))
+  and (deleted_at is null or author_id = (select auth.uid()))
+);
+
+create policy message_insert on public.message
+for insert to authenticated
+with check (
+  conversation_id = any ((select app.conversation_ids()))
+  and author_id = (select auth.uid())
+  and role = 'user'                       -- сообщения ассистента пишет только сервис
+);
+
+-- правка и удаление — только своё, и только пока свежее
+create policy message_update on public.message
+for update to authenticated
+using      ( author_id = (select auth.uid()) and created_at > now() - interval '24 hours' )
+with check ( author_id = (select auth.uid()) );
+
+create policy message_reaction_all on public.message_reaction
+for all to authenticated
+using ( exists (select 1 from public.message m
+                 where m.id = message_id
+                   and m.conversation_id = any ((select app.conversation_ids()))) )
+with check ( user_id = (select auth.uid())
+             and exists (select 1 from public.message m
+                          where m.id = message_id
+                            and m.conversation_id = any ((select app.conversation_ids()))) );
+
+create policy message_read_all on public.message_read
+for all to authenticated
+using      ( user_id = (select auth.uid()) )
+with check ( user_id = (select auth.uid()) );
+
+create policy message_attachment_select on public.message_attachment
+for select to authenticated
+using ( exists (select 1 from public.message m
+                 where m.id = message_id
+                   and m.conversation_id = any ((select app.conversation_ids()))) );
+```
+
+**Realtime channel authorisation** — the same `app.conversation_ids()` guards the socket:
+
+```sql
+-- Топики вида 'conversation:<uuid>'
+create policy realtime_conversation_read on realtime.messages
+for select to authenticated
+using (
+  realtime.topic() like 'conversation:%'
+  and (substring(realtime.topic() from 14))::uuid = any ((select app.conversation_ids()))
+);
+
+-- Писать в канал напрямую нельзя: сообщения идут через INSERT в public.message,
+-- а в канал их выкладывает триггер. Это исключает подделку author_id.
+create policy realtime_presence_write on realtime.messages
+for insert to authenticated
+with check (
+  realtime.topic() like 'presence:conversation:%'
+  and (substring(realtime.topic() from 23))::uuid = any ((select app.conversation_ids()))
+);
+```
+
+and the trigger that publishes:
+
+```sql
+create or replace function public.message_broadcast()
+returns trigger
+language plpgsql
+security definer
+set search_path = ''
+as $$
+begin
+  perform realtime.broadcast_changes(
+    'conversation:' || coalesce(NEW.conversation_id, OLD.conversation_id)::text,
+    TG_OP, TG_OP, TG_TABLE_NAME, TG_TABLE_SCHEMA, NEW, OLD
+  );
+  return null;
+end;
+$$;
+
+create trigger message_broadcast_trg
+  after insert or update or delete on public.message
+  for each row execute function public.message_broadcast();
+
+-- поддержка счётчика ветки
+create or replace function public.message_thread_counter()
+returns trigger language plpgsql security definer set search_path = '' as $$
+begin
+  if NEW.reply_to_id is not null then
+    NEW.thread_root_id := coalesce(
+      (select coalesce(m.thread_root_id, m.id) from public.message m where m.id = NEW.reply_to_id),
+      NEW.reply_to_id);
+    update public.message set reply_count = reply_count + 1 where id = NEW.thread_root_id;
+  end if;
+  update public.conversation set last_message_at = NEW.created_at where id = NEW.conversation_id;
+  return NEW;
+end;
+$$;
+create trigger message_thread_trg before insert on public.message
+  for each row execute function public.message_thread_counter();
+```
+
+Client side:
+
+```ts
+await supabase.realtime.setAuth();                    // обязательно для private
+const ch = supabase
+  .channel(`conversation:${conversationId}`, { config: { private: true } })
+  .on('broadcast', { event: 'INSERT' }, (p) => appendMessage(p.payload.record))
+  .on('broadcast', { event: 'UPDATE' }, (p) => patchMessage(p.payload.record))
+  .subscribe();
+
+const presence = supabase
+  .channel(`presence:conversation:${conversationId}`, {
+    config: { private: true, presence: { key: userId } },
+  })
+  .on('presence', { event: 'sync' }, () => setOnline(presence.presenceState()))
+  .subscribe(async (s) => {
+    if (s === 'SUBSCRIBED') await presence.track({ typing: false, at: Date.now() });
+  });
+```
+
+**Index required by the policy** — `realtime.messages` policies run on every channel join:
+`app.conversation_ids()` already leans on `conversation_participant_user_idx`
+(exists in `collaboration.ts`). Add
+`create index on public.conversation_participant(user_id) where left_at is null;`
+
+---
+
+## 6. Storage, files, and the ingestion pipeline
+
+### 6.1 Supabase Storage vs MinIO — recommendation: **MinIO**
+
+| | Supabase Storage | MinIO (already in compose) |
+|---|---|---|
+| Licence | Apache 2.0 `[V-src]` | AGPL-3.0 (server) — see caveat |
+| Authorisation | RLS on `storage.objects` — same model as data | IAM policies + app-issued pre-signed URLs |
+| Max size, standard upload | **5 GB** `[V-doc]` | Server-limited |
+| Max size, resumable (TUS) / S3 multipart | **50 GB** `[V-doc]` | 5 TB per object (S3 spec) |
+| Self-host default cap | `UPLOAD_FILE_SIZE_LIMIT=52428800` (50 MB) per tenant, overridable per bucket `[V-doc]` | Configurable |
+| Image transforms | imgproxy included | Not included |
+| Extra moving parts | storage-api + imgproxy + its own Postgres tables | One container |
+
+**Decision: MinIO,** because (a) it is already the compose'd store and `.env.example` is
+built around `S3_*`, (b) in production it is swapped for **Yandex Object Storage /
+VK Cloud** in a Russian region by changing one endpoint — Supabase Storage would have to
+be re-pointed *and* still needs a Russian S3 behind it anyway, and (c) audio/video from
+`meeting`/`transcript` will exceed the 50 MB default and the 5 GB standard-upload ceiling
+is uncomfortably close for long стенограммы.
+
+> **AGPL caveat `[UNVERIFIED]`.** MinIO's server is AGPL-3.0. We do not modify it and do not
+> offer it as a service, so obligations are minimal — but if legal is uncomfortable,
+> **SeaweedFS (Apache 2.0)** or **Garage (AGPL)** or simply Yandex Object Storage are drop-in
+> S3 replacements. Nothing in the code changes; `@aws-sdk/client-s3@3.1115.0` `[V-npm]`
+> speaks to all of them.
+
+Pre-signed URL flow — the browser never gets S3 credentials, and Nest gets to run the
+authorisation check that RLS would have run:
+
+```ts
+// POST /api/projects/:id/assets/upload-url
+@Post(':id/assets/upload-url')
+@UseGuards(SupabaseAuthGuard)
+async createUploadUrl(@Param('id') projectId: string, @CurrentUser() u: SupabaseJwt,
+                      @Body() dto: CreateUploadDto) {
+  await this.acl.requireProjectRole(u.sub, projectId, 'contributor');
+  if (dto.byteSize > MAX_UPLOAD) throw new PayloadTooLargeException();
+  if (!ALLOWED_MIME.has(dto.mimeType)) throw new UnsupportedMediaTypeException();
+
+  // ключ содержит projectId — префикс становится границей арендатора в бакете
+  const key = `p/${projectId}/${randomUUID()}/${sanitize(dto.fileName)}`;
+  const url = await getSignedUrl(this.s3, new PutObjectCommand({
+    Bucket: process.env.S3_BUCKET, Key: key,
+    ContentType: dto.mimeType, ContentLength: dto.byteSize,
+    Metadata: { uploadedby: u.sub, projectid: projectId },
+  }), { expiresIn: 900 });                       // 15 минут
+
+  const asset = await this.assets.createPending({ projectId, key, uploadedBy: u.sub, ...dto });
+  return { assetId: asset.id, url, key };
+}
+```
+
+Download is the mirror image: `GET /api/assets/:id/url` → check `app.draft_role`/
+`app.project_role` → `getSignedUrl(GetObjectCommand, { expiresIn: 300 })`. **Never store a
+public bucket policy.** `minio-init` in the compose already does
+`mc anonymous set none local/doomatel-documents` — correct.
+
+### 6.2 Limits to set explicitly
+
+| Kind | Cap | Rationale |
+|---|---|---|
+| `document` (docx/pdf/odt/rtf) | 100 MB | Пакет законопроекта с приложениями |
+| `image` | 25 MB | Сканы, фотографии документов |
+| `audio` (совещание, стенограмма) | 2 GB | 8 ч моно 128 kbps ≈ 460 MB; запас ×4 |
+| `video` | 5 GB | Записи заседаний |
+| `archive` (zip) | 200 MB | Разворачивается сервером, не клиентом |
+| Per-project quota | 100 GB, конфигурируемо | Иначе один проект съест хранилище |
+
+Enforce **three times**: client (UX), pre-signed `ContentLength` (S3 rejects mismatch), and
+a post-upload `HeadObject` check in the ingestion worker (defence against a tampered
+`ContentLength`).
+
+### 6.3 Virus scanning
+
+`clamscan@2.4.0` `[V-npm]` talks to a `clamd` daemon over TCP or UNIX socket using the
+**INSTREAM** protocol (4-byte big-endian length-prefixed chunks; daemon replies
+`stream: OK` or `stream: <Name> FOUND`) `[V-search]` https://github.com/kylefarris/clamscan .
+
+```yaml
+# infra/docker-compose.yml — добавить
+  clamav:
+    image: clamav/clamav:1.4
+    container_name: doomatel-clamav
+    environment:
+      CLAMAV_NO_MILTERD: 'true'
+      FRESHCLAM_CHECKS: '4'
+    ports: ['3310:3310']
+    volumes: [clamav-db:/var/lib/clamav]
+    healthcheck:
+      test: ['CMD-SHELL', 'clamdscan --ping 1 || exit 1']
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 180s      # первая загрузка баз занимает минуты
+```
+
+```ts
+// packages/ingest/src/scan.ts — стримом из S3, файл не материализуется на диск
+import NodeClam from 'clamscan';
+const clam = await new NodeClam().init({
+  clamdscan: { host: 'clamav', port: 3310, timeout: 120_000 },
+  preference: 'clamdscan',
+});
+const body = (await s3.send(new GetObjectCommand({ Bucket, Key }))).Body as Readable;
+const { isInfected, viruses } = await clam.scanStream(body);
+```
+
+**State machine**: `asset.processing_status` goes
+`pending → scanning → processing → ready`, or `→ failed` with
+`processing_error = 'infected: <name>'`. An infected object is **deleted from S3
+immediately**, the `asset` row is kept with the failure reason, and an `audit_log` entry
+`asset.infected` is written. The uploader is notified; the file is never re-servable.
+
+`[UNVERIFIED]` ClamAV is **not** a ФСТЭК-certified антивирус (§3.5). Keep the scanner
+behind an interface (`interface FileScanner { scan(stream): Promise<Verdict> }`) so
+Kaspersky Scan Engine / Dr.Web can replace it without touching the pipeline.
+
+### 6.4 Ingestion pipeline: upload → text → chunks → embeddings
+
+```
+ client  ──presigned PUT──▶  S3/MinIO
+    │
+    └── POST /assets/:id/complete ──▶ Nest ──▶ BullMQ queue "ingest"
+                                                   │
+   ┌───────────────────────────────────────────────┘
+   ▼
+ [1] verify        HeadObject: размер, ETag; sha256 стримом → asset.sha256
+                   ДЕДУПЛИКАЦИЯ: если sha256 уже есть — переиспользовать извлечённый текст
+   ▼
+ [2] scan          ClamAV INSTREAM (§6.3)                → status=scanning
+   ▼
+ [3] extract       по MIME:                               → status=processing
+                     .docx  → mammoth@1.12.1 (HTML+стили) ИЛИ прямой разбор OOXML
+                              для сохранения нумерации статей — критично для законопроектов
+                     .pdf   → pdf-parse@2.4.5 текстовый слой;
+                              если текста < 100 симв/стр → OCR (Tesseract rus / PaddleOCR)
+                     .rtf/.odt → LibreOffice --headless --convert-to docx (sidecar)
+                     image  → OCR
+                     audio  → ASR (см. отдельный документ), → transcript/transcript_segment
+                     link   → SourceFetcher из packages/ingest (Jina/Playwright, §00)
+   ▼
+ [4] normalize     нормализация типографики (ё, «», неразрывные пробелы, № ),
+                   распознавание структуры: Статья/Часть/Пункт/Подпункт/Абзац
+                   → те же правила, что в 04-retrieval.md §5
+   ▼
+ [5] chunk         структурно-осознанное разбиение (04-retrieval.md §5.2)
+   ▼
+ [6] embed         батч → EMBEDDINGS_BASE_URL, 1024-мерные векторы
+   ▼
+ [7] index         upsert в Qdrant (payload: assetId, projectId, orgId — ФИЛЬТР
+                   АРЕНДАТОРА ОБЯЗАТЕЛЕН) + tsvector в Postgres
+   ▼
+ [8] done          asset.extracted_text, status=ready
+                   realtime.send(... 'asset:ready', 'project:<id>', true)
+```
+
+Two non-obvious requirements:
+
+* **Tenant filter in the vector store is mandatory and is *not* covered by RLS.** Qdrant has
+  no RLS. Every search must carry `filter: { must: [{ key: 'projectId', match: { any: visibleProjectIds } }] }`.
+  Get `visibleProjectIds` from `app.visible_project_ids()` — **the same function**, so
+  Postgres and Qdrant cannot disagree. Deleting a project must enqueue a Qdrant purge; a
+  dangling vector is a data leak.
+* **Idempotency.** Key every job by `sha256` so a retried job does not double-index. Steps
+  1–8 must each be resumable: store the furthest completed step on the `asset` row.
+
+Verified packages `[V-npm]`: `mammoth@1.12.1`, `pdf-parse@2.4.5`, `@aws-sdk/client-s3@3.1115.0`,
+`clamscan@2.4.0`, `tus-js-client@4.3.1`, `@tus/server@2.4.4`, `unzipper@0.12.5`.
+
+---
+
+## 7. Background jobs and scheduling
+
+### 7.1 The candidates
+
+| | Transport | Licence | Self-host | Fit |
+|---|---|---|---|---|
+| **BullMQ** `6.1.2` `[V-npm]` | Redis | MIT `[V-src]` | Trivial (Redis already in compose) | Rate limiting, priorities, flows/parent-child, repeatable jobs, delayed jobs |
+| **pg-boss** `12.27.0` `[V-npm]` | Postgres `SKIP LOCKED` | MIT `[V-src]` | Zero new infra | ACID with the business transaction; archiving, singleton keys, cron |
+| **pgmq** `1.5.1` | Postgres | PostgreSQL Lic. `[V-src]` | **Already in `supabase/postgres`** `[V-src]` | Primitive queue only — no scheduler, no retry policy, no UI |
+| **Temporal** | own cluster | Apache 2.0 | Heavy: server + Cassandra/Postgres + Elasticsearch; reported €2.5–4.5k/mo self-hosted `[V-search]` | Durable execution, multi-week workflows |
+| **Inngest** | own server | **SSPL** at release, converts to Apache 2.0 after 3 years `[V-search]` | Possible but SSPL | Good DX, wrong licence for a state contour |
+
+### 7.2 Recommendation: **BullMQ + Redis** as the executor, `pg_cron` as the clock
+
+Reasoning:
+
+1. Redis is **already** in `infra/docker-compose.yml` with `appendonly yes` and
+   `maxmemory-policy noeviction` — the latter is exactly right for a queue (an evicted job
+   is a lost job) and suggests it was provisioned with this in mind.
+2. Our workloads need the features Redis-backed BullMQ has and pgmq does not:
+   **rate limiting** (LLM/embedding endpoint concurrency), **flows** (extract → chunk →
+   embed → index as a parent-child graph), **priorities** (an interactive agent run must
+   preempt a nightly crawl), **backoff**.
+3. Embedding and ASR jobs are **CPU/GPU-heavy and long**. Running them through Postgres
+   means long-lived transactions or heavy polling against the same DB that serves
+   interactive RLS queries. Keep that traffic off the primary.
+4. `pg_cron 1.6.4` is in the image `[V-src]` — use it as the **scheduler of record** (it
+   survives app restarts and is visible to a DBA), and have it enqueue into BullMQ via a
+   thin Nest endpoint or via `pgmq` + a bridge:
+
+```sql
+select cron.schedule('sozd-poll-hourly', '7 * * * *', $$
+  select pgmq.send('jobs_bridge', jsonb_build_object('queue','crawl','name','sozd.poll'));
+$$);
+select cron.schedule('deputy-registry-nightly', '30 2 * * *', $$
+  select pgmq.send('jobs_bridge', jsonb_build_object('queue','sync','name','deputies.reconcile'));
+$$);
+```
+
+A single Nest worker reads `pgmq` with `pgmq.read/pgmq.delete` and `queue.add(...)` into
+BullMQ. This gives cron durability without putting the whole queue in Postgres.
+Verified npm client: `pgmq-js@1.3.1` `[V-npm]`. `@nestjs/bullmq@11.0.5` and
+`@nestjs/schedule@6.1.3` are both current `[V-npm]`.
+
+```ts
+// apps/worker/src/queues.ts
+export const QUEUES = {
+  ingest:   'ingest',     // extract → chunk → embed → index (flow)
+  crawl:    'crawl',      // СОЗД / duma.gov.ru / pravo.gov.ru
+  embed:    'embed',      // rate-limited: { max: 8, duration: 1000 }
+  asr:      'asr',        // concurrency 1–2, GPU-bound
+  agent:    'agent',      // длинные прогоны Mastra
+  notify:   'notify',
+} as const;
+
+new Worker(QUEUES.embed, processor, {
+  connection,
+  concurrency: 4,
+  limiter: { max: 8, duration: 1000 },      // защита эмбеддинг-эндпоинта
+});
+```
+
+**When to revisit.** If the deployment must be single-container / no-Redis (a real
+possibility for an on-prem installation в аппарате фракции), **pg-boss@12.27.0** is the
+swap: same job model, one fewer service. Design the worker layer behind a
+`JobQueue` interface from day one so the swap is a module, not a rewrite.
+
+### 7.3 Long agent runs are *not* a queue problem
+
+`03-mastra.md` §2.5.1 already establishes Mastra `suspend`/`resume` for human-in-the-loop.
+A законотворческий workflow can sit suspended for **days** waiting for a депутат to approve
+a formulation. Do not model that as a job with a visibility timeout.
+
+**Pattern:** BullMQ runs a *segment* of the workflow to the next suspension point, persists
+state to `public.workflow_run` / `workflow_step` (already in `collaboration.ts`), and the
+job **completes**. Resumption is a *new* job enqueued by the HTTP handler that receives the
+human's decision. Progress is streamed to the UI with `realtime.send()` from the worker.
+This keeps every job short, makes crash recovery trivial, and means we never need Temporal.
+
+Reconsider Temporal only if we end up with multi-service sagas that must be atomic across
+Qdrant + Postgres + TypeDB. `[UNVERIFIED — no such requirement identified yet]`
+
+---
+
+## 8. Observability
+
+### 8.1 Recommendation: OpenTelemetry as the wire, Langfuse as the LLM backend
+
+They are not competitors. Mastra's telemetry emits **OTel spans**
+(`03-mastra.md` §2.9); Langfuse ingests OTel natively `[V-search]`. So:
+
+```
+Mastra agents ─┐
+NestJS API    ─┼─ OTel SDK ─▶ OTel Collector ─┬─▶ Langfuse   (LLM traces, prompts, scores)
+Next.js SSR   ─┘                               ├─▶ Tempo/Jaeger (обычные трейсы)
+                                               ├─▶ Prometheus  (метрики)
+                                               └─▶ Loki        (логи)
+```
+
+One instrumentation, several sinks. Verified `[V-npm]`:
+`@opentelemetry/sdk-node@0.221.0`, `@opentelemetry/auto-instrumentations-node@0.79.0`,
+`@langfuse/otel@5.10.1`, `@langfuse/tracing@5.10.1`, `nestjs-pino@4.6.1`,
+`@nestjs/terminus@11.1.1`.
+
+**Do not** rely on "Mastra built-in observability" as the *storage* layer — it is an
+exporter, and the useful part (prompt/completion diffing, scoring, dataset curation,
+cost-per-run) lives in Langfuse.
+
+### 8.2 The Langfuse version problem in this repo — action required
+
+`infra/docker-compose.yml` pins `langfuse/langfuse:2` with a single Postgres. Docker Hub
+shows current tags `4.15` / `4` and `3.225` / `3` `[V-src]`. Facts:
+
+* Langfuse was **acquired by ClickHouse in January 2026**; the core stays MIT and
+  self-hostable `[V-search]` https://clickhouse.com/blog/langfuse-and-clickhouse-a-new-data-stack-for-modern-llm-applications
+* `LICENSE` confirms: `Copyright (c) 2023-2026 ClickHouse, Inc.` +
+  `Portions of this software are licensed as follows:` — **MIT core, proprietary `/ee`**
+  `[V-src]`. SSO enforcement, RBAC beyond basics, and some data-retention features are EE.
+  Plain self-hosted tracing is MIT.
+* v3+ requires **ClickHouse (≥24.3) + Redis + S3/MinIO + langfuse-web + langfuse-worker**
+  — six services `[V-search]` https://langfuse.com/self-hosting/deployment/infrastructure/clickhouse
+* Recommended footprint: **4+ vCPU, 16 GiB RAM, ≥100 GiB storage** `[V-search]`
+
+**Decision:** keep `langfuse/langfuse:2` for local dev under the existing `observability`
+compose profile (it is one container and good enough for a laptop), and deploy **v3/v4 with
+ClickHouse in staging/production only**. Document this explicitly, because a silent version
+gap between dev and prod on a tracing tool is how you discover schema-incompatible traces
+during an incident. Alternative if the ClickHouse footprint is unacceptable on-prem:
+**Phoenix (Arize, ELv2)** or plain OTel → Tempo, giving up prompt-level UX.
+
+### 8.3 Minimum instrumentation to ship in v1
+
+| Signal | Where | Why |
+|---|---|---|
+| `trace_id` propagated browser → Next → Nest → worker → LLM | OTel context, `nestjs-cls@6.2.1` `[V-npm]` | One id joins a user complaint to an agent run |
+| `user.id`, `project.id`, `org.id` as span attributes | Nest interceptor | Per-tenant latency/cost attribution |
+| LLM cost + token counts per `workflow_run` | Langfuse | Budget per фракция |
+| RLS policy timing | `pg_stat_monitor 2.1` (in image `[V-src]`) | Catches the §2.4 regression before users do |
+| `audit_log` write on every privileged action | Nest interceptor | §3.4 requirement, not optional |
+| Health/readiness | `@nestjs/terminus@11.1.1` | Postgres, Redis, Qdrant, MinIO, LLM endpoint |
+
+**Do not send traces outside the контур.** `TELEMETRY_ENABLED: 'false'` is already set for
+Langfuse in the compose `[repo]`; also set `QDRANT__TELEMETRY_DISABLED` (already set),
+`DO_NOT_TRACK=1`, and `NEXT_TELEMETRY_DISABLED=1`. Audit every new dependency for
+phone-home behaviour — under §3.5 this is a compliance item, not a preference.
+
+---
+
+## 9. Package manifest (all verified on the npm registry, 2026-08-20) `[V-npm]`
+
+```jsonc
+// apps/api (NestJS)
+"@nestjs/core":            "^11.2.1",
+"@nestjs/passport":        "^11.0.5",
+"@nestjs/websockets":      "^11.2.1",   // только если понадобится socket.io для collab
+"@nestjs/bullmq":          "^11.0.5",
+"@nestjs/schedule":        "^6.1.3",
+"@nestjs/terminus":        "^11.1.1",
+"@nestjs/throttler":       "^6.5.0",
+"passport-jwt":            "^4.0.1",
+"jwks-rsa":                "^4.1.0",
+"nestjs-pino":             "^4.6.1",
+"nestjs-cls":              "^6.2.1",
+"helmet":                  "^8.3.0",
+"@supabase/supabase-js":   "^2.112.3",  // ТОЛЬКО admin-API и storage, не для данных
+"drizzle-orm":             "^0.45.2",
+"pg":                      "^8.23.0",
+"bullmq":                  "^6.1.2",
+"pgmq-js":                 "^1.3.1",
+"@aws-sdk/client-s3":      "^3.1115.0",
+"@aws-sdk/s3-request-presigner": "^3.1115.0",
+"clamscan":                "^2.4.0",
+"mammoth":                 "^1.12.1",
+"pdf-parse":               "^2.4.5",
+"unzipper":                "^0.12.5",
+"@opentelemetry/sdk-node": "^0.221.0",
+"@opentelemetry/auto-instrumentations-node": "^0.79.0",
+"@langfuse/otel":          "^5.10.1",
+"@langfuse/tracing":       "^5.10.1"
+
+// apps/web (Next.js)
+"@supabase/supabase-js":   "^2.112.3",
+"@supabase/ssr":           "^0.12.4",   // cookie-based сессии в App Router
+
+// альтернативы / запасные варианты
+"pg-boss":                 "^12.27.0",  // если отказываемся от Redis
+"kysely":                  "^0.29.5",   // если понадобится типизированный сложный SQL
+"tus-js-client":           "^4.3.1",    // резюмируемые загрузки крупных аудио/видео
+"@tus/server":             "^2.4.4",
+"openid-client":           "^6.8.7",    // если ЕСИА-шлюз придётся подключать в обход GoTrue
+"socket.io":               "^4.8.3"     // apps/collab (Yjs)
+```
+
+Images (verified on Docker Hub `[V-src]`):
+`supabase/postgres:17.6.1.165`, `langfuse/langfuse:4.15` (prod) / `:2` (dev),
+`qdrant/qdrant:v1.16.1`, `redis:8-alpine`, `clamav/clamav:1.4`.
+
+---
+
+## 10. Open questions and risks
+
+### Risks
+
+| # | Risk | Impact | Mitigation |
+|---|---|---|---|
+| R1 | **`supabase/postgres` vs Postgres Pro Certified** is an either/or. Certified Russian Postgres does not ship `pgmq`/`pgroonga`/`vector 0.8.2`; Supabase Realtime + GoTrue assume Supabase's schema bootstrap. Choosing wrong costs a rewrite of §2 and §5. | **High** | Decide before the schema hardens. Keep RLS helpers in plain SQL (they are); keep vectors in Qdrant (already decided) so the DB is not the AI dependency; treat `pgmq` as optional (§7.2 works without it). |
+| R2 | RLS performance collapse at scale — §2.4's array pattern is a design claim, **not measured**. | Medium-High | Build the `pgtap` suite (§2.8) *and* a load fixture: 200 орг, 5 000 профилей, 20 000 проектов, 2 млн `draft`. Gate merges on `explain (analyze)` regression. |
+| R3 | **ЕСИА is a 12–18 month organisational project**, not a sprint. Building v1 assuming it exists will block launch. | High | v1 ships email+TOTP+optional SAML. `profile.esia_oid` reserved now, wiring later. |
+| R4 | ФСТЭК № 117 (в силе с 01.03.2026) applies broadly and demands **continuous** аттестация; a floating dependency graph invalidates it. | High | Pin every image by digest, every npm dep exactly, from day one. Reproducible builds. SBOM in CI. |
+| R5 | Langfuse v2→v3/v4 gap between dev and prod (§8.2). | Medium | Pin both explicitly; document; plan the ClickHouse footprint in the prod compose. |
+| R6 | Realtime `realtime.messages` policy runs `app.conversation_ids()` on **every channel join**. A big org opening 30 conversations = 30 evaluations. | Medium | Cache the array per connection in Nest and issue a short-lived channel token; or denormalise into a `conversation_member_flat` table refreshed by trigger. |
+| R7 | **Qdrant has no RLS.** A forgotten tenant filter in one query is a cross-party data leak — the single most damaging failure mode for this product. | **High** | Never call the Qdrant client directly from feature code. One `RetrievalService.search()` that *requires* a `viewerId` and derives the filter from `app.visible_project_ids()`. Lint rule banning direct imports of the Qdrant client outside that module. |
+| R8 | MinIO AGPL-3.0 in a state contour may raise objections. | Low-Medium | S3 API is the abstraction; swap to Yandex Object Storage / SeaweedFS with an env change. |
+| R9 | `message_read` table growth (§5.3). | Medium | Trigger-enforced participant cap; `pg_partman` on `message`. |
+| R10 | Cross-org `project_share` with `expires_at` — expiry is checked in the helper, so a **cached** `visible_project_ids()` array inside a long transaction can outlive the grant. | Low | Grants expire at hour granularity in practice; additionally re-check `app.project_role()` in the write path (already the case). |
+
+### Open questions
+
+1. **Партия → фракция inheritance direction (§2.2).** Upward closure is my proposal. Does
+   a Партия administrator expect to see фракция projects by default? This is a political
+   question with a one-line SQL consequence — get it answered before launch.
+2. **Who may create a cross-party `project_share`?** §2.6 restricts it to project `owner`
+   and caps the granted role at `editor`. Is that the right political guardrail, or should
+   it require two-person approval (депутат + аппарат)?
+3. **Is Doomatel a ГИС?** Determines whether приказ ФСТЭК № 117 applies in full, whether
+   реестр отечественного ПО matters, and therefore R1. Needs an answer from the customer,
+   not from us.
+4. **Retention policy for `message` and `draft_version`.** Законотворческая переписка may
+   be subject to archival requirements (ФЗ-125 «Об архивном деле»). Unresearched.
+5. **MFA mandatory or optional?** §4.1 has the `aal2` guard ready. Recommend: mandatory for
+   `is_verified` deputies, optional for помощники. Product decision.
+6. **Does `независимый депутат` need a synthetic organisation row?** The schema has
+   `organization_kind = 'independent'`. Cleaner alternative: `organization_id IS NULL` +
+   `scope='personal'`. Both are supported by the RLS above; pick one and enforce it with a
+   check constraint, or the two paths will drift.
+7. **Yjs/collab transport (§5.2)** — confirmed as a separate service, but its auth story is
+   unwritten: it needs to verify the same Supabase JWT and call `app.draft_role()` before
+   attaching a document. Not covered here.
+
+---
+
+## 11. What to build first (ordering that de-risks the most)
+
+1. `packages/db/migrations/0000_rls_helpers.sql` + `0001_rls_policies.sql` (§2.5–2.6) and
+   the `pgtap` suite (§2.8), **including the cross-party fixture**. Everything else is
+   easier to change than this.
+2. `TxService.asUser()` (§4.3) — because it is what makes those policies actually execute.
+3. `SupabaseJwtStrategy` + `Aal2Guard` (§4.1), with the project switched to **asymmetric
+   JWT keys** and `SUPABASE_JWT_SECRET` deleted from `.env.example` for non-Auth services.
+4. Invitation → verification flow (§3.2) — it is the gate everything else sits behind.
+5. `RetrievalService.search()` with the mandatory tenant filter (R7) before any agent can
+   call retrieval.
+6. Chat: schema additions (§5.3), policies (§5.4), broadcast trigger, client channels.
+7. Upload → scan → extract pipeline (§6.4) behind BullMQ (§7.2).
+8. OTel + Langfuse wiring (§8.3).
