@@ -5,3 +5,4 @@ export * from './embeddings/client.js';
 export * from './rerank/client.js';
 export * from './qdrant/collection.js';
 export * from './qdrant/search.js';
+export * from './indexer.js';

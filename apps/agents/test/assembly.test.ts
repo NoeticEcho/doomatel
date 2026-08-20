@@ -97,7 +97,8 @@ describe('сборка Mastra', () => {
   });
 
   it('инструкции запрещают воспроизводить нормы по памяти', async () => {
-    for (const key of ['analyst', 'drafter', 'expert', 'finance', 'speech']) {
+    const keys = ['analyst', 'drafter', 'expert', 'finance', 'speech'] as const;
+    for (const key of keys) {
       const instructions = await mastra.getAgent(key).getInstructions();
       expect(String(instructions), `агент ${key}`).toContain('по памяти');
     }
