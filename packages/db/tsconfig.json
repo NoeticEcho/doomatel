@@ -1,0 +1,5 @@
+{
+  "extends": "@doomatel/tsconfig/node.json",
+  "compilerOptions": { "outDir": "dist", "rootDir": ".", "types": ["node"] },
+  "include": ["src/**/*.ts", "test/**/*.ts", "tsup.config.ts", "drizzle.config.ts"]
+}

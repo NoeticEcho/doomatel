@@ -1148,3 +1148,750 @@ CREATE INDEX unit_wid      IF NOT EXISTS FOR (u:Unit) ON (u.wid);
 ```
 
 > ⚠️ **Про Apache AGE:** Cypher-запросы оборачиваются в `SELECT * FROM cypher('graph_name', $$ … $$) AS (v agtype);` и **типизация результата — `agtype`**, что требует ручного разбора. Плюс AGE **не поддерживает** часть openCypher (например, `MERGE` с `ON MATCH` в старых версиях). Проверить на целевой версии PG. **[U]**
+
+---
+
+## 5. Извлечение правовых ссылок из русского текста
+
+### 5.1 Состояние экосистемы
+
+**Готовой библиотеки нет.** Поиск по npm, PyPI и GitHub не выявил зрелого парсера российских правовых ссылок. **[V — по результатам поиска]**
+
+Что есть релевантного:
+
+| Инструмент | Что даёт | Пригодность |
+|---|---|---|
+| **`natasha/yargy`** (github.com/natasha/yargy) | Rule-based извлечение фактов для русского языка, аналог Томита-парсера. Python 3.7+, PyPy3, зависит только от `pymorphy2`. **[V]** | 🥇 **Лучший готовый инструмент**, но грамматику пишем сами |
+| **`natasha/natasha`** | NER, морфология, синтаксис; внутри использует yargy **[V]** | вспомогательно (нормализация ФИО, организаций) |
+| **`vas3k/python-glr-parser`** | GLR-парсер для русского **[V]** | альтернатива yargy, менее живая **[U]** |
+| **`openlegaldata/legal-reference-extraction`** | Извлечение ссылок из **немецких** судебных актов **[V]** | 🥈 **источник архитектурных идей**, не кода |
+| **`freelawproject/eyecite`** | Парсер **американских** цитат **[V]** | источник идей (resolution/normalization pipeline) |
+| **Gist `kuk/554499843fb3875ad3861e2b403126cc`** | Тестовое задание с **train.jsonl из 1000 размеченных предложений** со ссылками вида «ч. 3 ст.19 АПК РФ», «ст.ст. 15, 309 ГК РФ» + целевой JSON-формат **[V]** | 🥇 **готовый небольшой gold-set для регрессионных тестов** |
+| **RusLawOD `<textIPS>`** | Текст с инлайн `<ref>linked text</ref>` — **готовая разметка ссылок из ИПС** **[V]** | 🥇 **дистанционный supervision: сотни тысяч примеров ссылок** |
+
+> 💡 **Ключевая находка для реализации:** RusLawOD хранит текст с уже проставленными `<ref>` (в основном на изменяющие акты) **[V]**. Это даёт нам **бесплатный обучающий/валидационный корпус** для парсера без ручной разметки. Плюс gold-set из gist'а на 1000 предложений.
+
+### 5.2 Анатомия российской правовой ссылки
+
+Разбор целевого примера:
+
+```
+в соответствии с пунктом 2 части 3 статьи 15 Федерального закона от 27.07.2006 N 149-ФЗ
+                └─────┬────┘ └────┬───┘ └───┬────┘ └──────────────┬──────────────────┘
+                  point=2     part=3    article=15         акт-дескриптор
+```
+
+**Правило порядка:** в русском юридическом узусе структурные единицы идут **от мелкой к крупной** (пункт → часть → статья), затем — **дескриптор акта**. Это **противоположно** английскому. Грамматика должна это учитывать.
+
+**Классы форм:**
+
+1. **Полная ссылка с датой и номером**
+   `Федерального закона от 27.07.2006 N 149-ФЗ`
+   `Федерального конституционного закона от 21.07.1994 N 1-ФКЗ`
+   `Указа Президента Российской Федерации от 15.03.2000 N 511`
+   `постановления Правительства Российской Федерации от 30.06.2021 N 1119`
+2. **Кодекс по имени** (без даты/номера)
+   `Гражданского кодекса Российской Федерации`, `ГК РФ`, `АПК РФ`, `КоАП РФ`, `НК РФ`
+3. **Само-ссылка** — `настоящего Федерального закона`, `настоящего Кодекса`, `настоящей статьи`, `настоящей части`
+4. **Сокращённая** — `ст. 15`, `ч.3 ст.19`, `п. 2 ч. 3 ст. 15`, `абз. 2 п. 1 ст. 8`
+5. **Множественная** (AKN `mref`) — `статей 15, 16 и 17`, `ст.ст. 15, 309 ГК РФ`, `частями 6, 7 статьи 210`
+6. **Диапазонная** (AKN `rref`) — `статьями 15 — 20`, `пунктах 1 – 3 части 2`
+7. **Ранее введённая аббревиатура** — `(далее — Закон о связи)` → затем `Закона о связи`
+8. **Ссылка внутри поправки** — `в части 3 статьи 15 слова "…" заменить словами "…"`
+
+**Морфологическая вариативность** (главная сложность):
+
+| лемма | падежные формы, встречающиеся в текстах |
+|---|---|
+| статья | стать**я**, стать**и**, стать**е**, стать**ю**, стать**ёй**/стать**ей**, стать**ями**, стать**ей** (род. мн.), стать**ях** |
+| часть | час**ть**, час**ти**, час**тью**, час**тей**, час**тями**, час**тях** |
+| пункт | пункт, пункт**а**, пункт**у**, пункт**ом**, пункт**е**, пункт**ах**, пункт**ами**, пункт**ов** |
+| подпункт | подпункт, подпункт**а**, … |
+| абзац | абзац, абзац**а**, абзац**ем**, абзац**е**, абзац**ах** |
+| глава | глав**а**, глав**ы**, глав**е**, глав**ой**, глав**ах** |
+
+### 5.3 Грамматика (EBNF)
+
+```ebnf
+(* ══════════ ВЕРХНИЙ УРОВЕНЬ ══════════ *)
+Reference       ::= UnitChain? ActDescriptor
+                  | UnitChain SelfMarker
+                  | UnitChain                     (* внутридокументная, акт из контекста *)
+
+(* ══════════ ЦЕПОЧКА СТРУКТУРНЫХ ЕДИНИЦ (мелкая → крупная) ══════════ *)
+UnitChain       ::= UnitGroup ( Sep? UnitGroup )*
+UnitGroup       ::= UnitWord Nums
+UnitWord        ::= AbzacW | PodpunktW | PunktW | ChastW | StatyaW
+                  | ParagrafW | GlavaW | RazdelW | PrilozhenieW | PrimechanieW
+Sep             ::= "," | "и" | "а также"
+
+(* ══════════ НОМЕРА: одиночные, списки, диапазоны ══════════ *)
+Nums            ::= NumItem ( NumSep NumItem )*
+NumItem         ::= NumToken ( Dash NumToken )?     (* диапазон → rref *)
+NumSep          ::= "," | "и" | ";"
+Dash            ::= "-" | "—" | "–" | "‒"
+NumToken        ::= ArabicNum         (* 15, 15.1, 15.2-1 *)
+                  | RomanNum          (* IV *)
+                  | RuLetter          (* а), б), в) *)
+ArabicNum       ::= DIGIT+ ( ( "." | "-" ) DIGIT+ )*
+RuLetter        ::= [а-яё] ")"?
+
+(* ══════════ ДЕСКРИПТОР АКТА ══════════ *)
+ActDescriptor   ::= FullActRef | CodexRef | NamedActRef | AbbrevRef
+
+FullActRef      ::= ActTypeWord Issuer? DateClause NumClause
+ActTypeWord     ::= "Федерального закона" | "Федерального конституционного закона"
+                  | "Закона Российской Федерации" | "Указа" | "Постановления"
+                  | "Распоряжения" | "Приказа" | "Кодекса"  (* + все падежные формы *)
+Issuer          ::= "Президента Российской Федерации"
+                  | "Правительства Российской Федерации"
+                  | "Российской Федерации" | "РФ"
+                  | OrganName
+DateClause      ::= "от" Date
+Date            ::= DD "." MM "." YYYY
+                  | DD MonthNameRu YYYY G?          (* «27 июля 2006 года» *)
+NumClause       ::= ( "N" | "№" | "N." ) ActNumber
+ActNumber       ::= DIGIT+ ( "-" ( "ФЗ" | "ФКЗ" | "ЗРФ" ) )?
+                  | DIGIT+ "/" DIGIT+
+                  | DIGIT+ RuLetter?
+
+CodexRef        ::= CodexFullName | CodexAbbrev
+CodexFullName   ::= ( "Гражданского" | "Уголовного" | "Налогового" | "Трудового"
+                    | "Семейного" | "Жилищного" | "Земельного" | "Бюджетного"
+                    | "Градостроительного" | "Лесного" | "Водного" | "Воздушного"
+                    | "Таможенного" | "Арбитражного процессуального"
+                    | "Гражданского процессуального" | "Уголовно-процессуального"
+                    | "Уголовно-исполнительного" ) "кодекса" RF?
+                  | "Кодекса Российской Федерации об административных правонарушениях"
+CodexAbbrev     ::= ( "ГК" | "УК" | "НК" | "ТК" | "СК" | "ЖК" | "ЗК" | "БК"
+                    | "ГрК" | "ЛК" | "ВК" | "ТмК" | "АПК" | "ГПК" | "УПК"
+                    | "УИК" | "КоАП" | "КАС" ) RF?
+RF              ::= "РФ" | "Российской Федерации"
+
+NamedActRef     ::= "Федерального закона" Quote Title Quote     (* «О связи» *)
+AbbrevRef       ::= PreviouslyDefinedAbbrev                      (* из «(далее — …)» *)
+
+SelfMarker      ::= "настоящего Федерального закона" | "настоящего Кодекса"
+                  | "настоящей статьи" | "настоящей части" | "настоящего пункта"
+```
+
+### 5.4 Реализация: гибридный конвейер
+
+**[U — авторское проектное предложение]**
+
+```
+                    ┌────────────────────────────────────────────┐
+текст ─────────────▶│ 1. Токенизация + морфоразбор              │
+                    │    (natasha / pymorphy2 / RuBERT-lemmatizer)│
+                    └───────────────────┬────────────────────────┘
+                                        ▼
+                    ┌────────────────────────────────────────────┐
+                    │ 2. Кандидаты: скользящие регулярные окна   │
+                    │    вокруг якорей (статья|часть|пункт|…)    │
+                    └───────────────────┬────────────────────────┘
+                                        ▼
+                    ┌────────────────────────────────────────────┐
+                    │ 3. Разбор грамматикой §5.3 → ParsedReference│
+                    └───────────────────┬────────────────────────┘
+                                        ▼
+                    ┌────────────────────────────────────────────┐
+                    │ 4. РАЗРЕШЕНИЕ (resolution):                │
+                    │    • акт-дескриптор → act.id по (вид,дата,№)│
+                    │    • «настоящий …» → из контекста документа │
+                    │    • сокращения → таблица «(далее — …)»     │
+                    │    • eId цепочки → unit.id в нужной редакции│
+                    └───────────────────┬────────────────────────┘
+                                        ▼
+                    ┌────────────────────────────────────────────┐
+                    │ 5. LLM-арбитр ТОЛЬКО для нераспознанного    │
+                    │    (< 5% случаев) + confidence < 0.8        │
+                    └───────────────────┬────────────────────────┘
+                                        ▼
+                              legal_edge (вид='ссылается_на')
+```
+
+> 🔑 **Принципиально: LLM — НЕ основной экстрактор.** Правовые ссылки — регулярная, формализованная конструкция; детерминированная грамматика даёт воспроизводимость, скорость и объяснимость. LLM подключается как fallback на «хвост» (нестандартные формулировки, ссылки на утратившие силу акты, неоднозначные аббревиатуры). Для юридического продукта воспроизводимость критична. **[U]**
+
+**Целевой тип результата:**
+
+```ts
+// packages/legal-refs/src/types.ts
+import { z } from "zod";   // zod@4.4.3 [V]
+
+export const StructuralUnitRef = z.object({
+  kind: z.enum(["razdel","podrazdel","glava","paragraf","statya",
+                "chast","punkt","podpunkt","abzac","primechanie","prilozhenie"]),
+  /** одиночный номер, или список, или диапазон */
+  nums: z.array(z.union([
+    z.object({ t: z.literal("single"), n: z.string() }),
+    z.object({ t: z.literal("range"),  from: z.string(), to: z.string() }),
+  ])).min(1),
+});
+
+export const ActRef = z.discriminatedUnion("t", [
+  z.object({ t: z.literal("full"),
+             actType: z.string(),          // 'fz' | 'fkz' | 'ukaz' | …
+             issuer:  z.string().nullable(),
+             date:    z.string(),          // ISO 'YYYY-MM-DD'
+             number:  z.string() }),       // '149-ФЗ'
+  z.object({ t: z.literal("codex"),  name: z.string() }),          // 'ГК' | 'АПК'
+  z.object({ t: z.literal("named"),  title: z.string() }),         // «О связи»
+  z.object({ t: z.literal("abbrev"), abbrev: z.string() }),        // 'Закон о связи'
+  z.object({ t: z.literal("self"),   scope: z.enum(["act","article","part","point"]) }),
+]);
+
+export const ParsedReference = z.object({
+  /** [start, end) в исходном тексте — как в gold-set из gist'а kuk */
+  span:  z.tuple([z.number().int(), z.number().int()]),
+  raw:   z.string(),
+  /** цепочка от мелкой к крупной, как в тексте */
+  units: z.array(StructuralUnitRef),
+  act:   ActRef.nullable(),
+  /** после стадии разрешения */
+  resolved: z.object({
+    actId:  z.string().uuid().nullable(),
+    unitIds: z.array(z.string().uuid()),
+    /** канонический AKN-URI */
+    uri: z.string().nullable(),
+  }).nullable(),
+  confidence: z.number().min(0).max(1),
+});
+export type ParsedReference = z.infer<typeof ParsedReference>;
+```
+
+**Ядро регулярных выражений (TypeScript, Unicode-aware):**
+
+```ts
+// packages/legal-refs/src/patterns.ts
+
+/** Морфологические варианты названий структурных единиц. Ключ — канонический kind. */
+export const UNIT_WORDS: Record<string, string> = {
+  statya:   String.raw`стат(?:ья|ьи|ье|ью|ьёй|ьей|ьями|ьях|ей)|ст\.?\s*ст\.?|ст\.`,
+  chast:    String.raw`част(?:ь|и|ью|ей|ями|ях)|ч\.`,
+  punkt:    String.raw`пункт(?:а|у|ом|е|ах|ами|ов)?|п\.`,
+  podpunkt: String.raw`подпункт(?:а|у|ом|е|ах|ами|ов)?|пп\.|подп\.`,
+  abzac:    String.raw`абзац(?:а|у|ем|е|ах|ами|ев)?|абз\.`,
+  paragraf: String.raw`параграф(?:а|у|ом|е|ах)?|§`,
+  glava:    String.raw`глав(?:а|ы|е|у|ой|ах|ами)|гл\.`,
+  razdel:   String.raw`раздел(?:а|у|ом|е|ах|ами|ов)?|разд\.`,
+  prilozhenie: String.raw`приложени(?:е|я|ю|ем|и|ях|ями)|прил\.`,
+  primechanie: String.raw`примечани(?:е|я|ю|ем|и|ях)`,
+};
+
+/** Номер: 15, 15.1, 15.2-1, IV, а) */
+export const NUM = String.raw`\d+(?:[.\-]\d+)*|[IVXLC]+|[а-яё]\)`;
+
+/** Список/диапазон номеров */
+export const NUM_LIST = String.raw`(?:${NUM})(?:\s*(?:[-—–]\s*(?:${NUM}))?` +
+                        String.raw`(?:\s*(?:,|и|;)\s*(?:${NUM})(?:\s*[-—–]\s*(?:${NUM}))?)*)`;
+
+/** Одна структурная группа: «пунктом 2», «частями 6, 7», «статьями 15 — 20» */
+export const unitGroup = (kind: keyof typeof UNIT_WORDS) =>
+  String.raw`(?<${kind}>(?:${UNIT_WORDS[kind]})\s*(?<${kind}_nums>${NUM_LIST}))`;
+
+/** Дескриптор акта: полная форма */
+export const FULL_ACT = String.raw`
+  (?<actType>
+      [Фф]едеральн(?:ого|ый|ым|ом)\s+конституционн(?:ого|ый|ым|ом)\s+закон(?:а|у|ом|е)?
+    | [Фф]едеральн(?:ого|ый|ым|ом)\s+закон(?:а|у|ом|е)?
+    | [Зз]акон(?:а|у|ом|е)?\s+Российской\s+Федерации
+    | [Уу]каз(?:а|у|ом|е)?
+    | [Пп]остановлени(?:я|е|ю|ем|и)
+    | [Рр]аспоряжени(?:я|е|ю|ем|и)
+    | [Пп]риказ(?:а|у|ом|е)?
+    | [Кк]одекс(?:а|у|ом|е)?
+  )
+  (?:\s+(?<issuer>
+      Президента\s+Российской\s+Федерации
+    | Правительства\s+Российской\s+Федерации
+    | Российской\s+Федерации
+    | РФ
+  ))?
+  \s+от\s+(?<date>\d{2}\.\d{2}\.\d{4}
+           |\d{1,2}\s+(?:января|февраля|марта|апреля|мая|июня|июля
+                       |августа|сентября|октября|ноября|декабря)\s+\d{4}(?:\s*г(?:ода|\.)?)?)
+  \s*(?:N|№|N\.)\s*(?<actNum>\d+(?:-(?:ФЗ|ФКЗ|ЗРФ))?|\d+/\d+|\d+[а-яё]?)
+`.replace(/\s+|#.*$/gm, (m) => (m.startsWith("#") ? "" : ""));  // строится через RegExp с флагом x-эмуляцией
+
+/** Кодексы: сокращения */
+export const CODEX_ABBREV =
+  String.raw`(?<codex>ГК|УК|НК|ТК|СК|ЖК|ЗК|БК|ГрК|ЛК|ВК|ТмК|АПК|ГПК|УПК|УИК|КоАП|КАС)` +
+  String.raw`(?:\s*(?:РФ|Российской\s+Федерации))?`;
+
+/** Само-ссылка */
+export const SELF_REF =
+  String.raw`настоящ(?:его|ей|ем|им)\s+` +
+  String.raw`(?<selfScope>Федерального\s+закона|Кодекса|стать[иеюй]|част[иью]|пункт[аеу])`;
+```
+
+**Полное правило-сборка** (порядок групп: мелкая → крупная, затем акт):
+
+```ts
+// packages/legal-refs/src/grammar.ts
+import { unitGroup, FULL_ACT, CODEX_ABBREV, SELF_REF } from "./patterns";
+
+const CHAIN = [
+  unitGroup("abzac"),
+  unitGroup("podpunkt"),
+  unitGroup("punkt"),
+  unitGroup("chast"),
+  unitGroup("statya"),
+  unitGroup("paragraf"),
+  unitGroup("glava"),
+  unitGroup("razdel"),
+].map((g) => `(?:${g}\\s*)?`).join("");
+
+export const REFERENCE_RE = new RegExp(
+  `${CHAIN}(?:${FULL_ACT}|${CODEX_ABBREV}|${SELF_REF})?`,
+  "giu"
+);
+```
+
+**Разбор целевого примера — ожидаемый результат:**
+
+```jsonc
+// вход: "в соответствии с пунктом 2 части 3 статьи 15 Федерального закона от 27.07.2006 N 149-ФЗ"
+{
+  "span": [17, 89],
+  "raw": "пунктом 2 части 3 статьи 15 Федерального закона от 27.07.2006 N 149-ФЗ",
+  "units": [
+    { "kind": "punkt",  "nums": [{ "t": "single", "n": "2"  }] },
+    { "kind": "chast",  "nums": [{ "t": "single", "n": "3"  }] },
+    { "kind": "statya", "nums": [{ "t": "single", "n": "15" }] }
+  ],
+  "act": { "t": "full", "actType": "fz", "issuer": null,
+           "date": "2006-07-27", "number": "149-ФЗ" },
+  "resolved": {
+    "actId": "…uuid…",
+    "unitIds": ["…uuid…"],
+    "uri": "akn://ru/act/fz/2006-07-27/149-ФЗ#art_15__part_3__point_2"
+  },
+  "confidence": 0.98
+}
+```
+
+Обратите внимание: **`eId` собирается из цепочки в ОБРАТНОМ порядке** (крупная → мелкая), как требует AKN Naming Convention: `art_15__part_3__point_2`. **[U]**
+
+### 5.5 Разрешение (resolution) — самое сложное
+
+Разбор — 30% работы. 70% — превратить `ParsedReference` в `unit.id`. **[U]**
+
+```sql
+-- Шаг 1: акт по (вид, дата, номер) — используем natural key
+SELECT id FROM legal.act
+WHERE вид = $1::legal.вид_акта_t AND дата_подписания = $2::date AND номер = $3;
+
+-- Шаг 1b: кодекс по сокращению
+SELECT id FROM legal.act WHERE $1 = ANY(сокращения) AND вид = 'kodeks';
+
+-- Шаг 2: редакция, действующая на дату документа-источника
+SELECT id FROM legal.expression
+WHERE act_id = $1 AND период @> $2::date;
+
+-- Шаг 3: структурная единица по eId в этой редакции
+SELECT id FROM legal.unit WHERE expression_id = $1 AND eid = $2;
+
+-- Шаг 3-fallback: если eId не совпал (перенумерация) — по wid
+SELECT u.id FROM legal.unit u
+JOIN legal.expression e ON e.id = u.expression_id
+WHERE u.wid = $1 AND e.act_id = $2 AND e.период @> $3::date;
+```
+
+**Правила разрешения неоднозначностей [U]:**
+1. **Темпоральное правило.** Ссылка разрешается в редакцию, действовавшую **на дату подписания документа-источника**, а не на сегодня. Иначе исторические ссылки поедут.
+2. **Само-ссылки.** `настоящего Федерального закона` → `act_id` текущего документа. `настоящей статьи` → ближайший предок-`statya` текущей единицы (по `unit_closure`).
+3. **Таблица аббревиатур.** Сканировать документ на `\(далее\s*[-—–]\s*(?<abbrev>[^)]+)\)` и строить локальный словарь до основного прохода.
+4. **Ненайденный акт.** НЕ отбрасывать — создавать «висячее» ребро с `dst_kind='unresolved'` и `payload` = разобранный дескриптор, `уверенность < 1`. Позже, когда акт появится в БД, фоновый джоб дошивает связь.
+5. **Диапазоны.** `статьями 15 — 20` разворачивается в N рёбер, но помечается `payload->>'rref' = 'true'` для корректного экспорта в AKN `<rref>`.
+
+### 5.6 Тестовая стратегия
+
+**[U]**
+
+| Слой | Данные | Метрика |
+|---|---|---|
+| Unit | ~200 рукописных случаев (по одному на каждую форму из §5.2) | 100% |
+| Gold-set | 1000 предложений из gist `kuk/554499843…` **[V]** | span F1 ≥ 0.95, structure F1 ≥ 0.92 |
+| Distant supervision | `<ref>` из `<textIPS>` RusLawOD **[V]** | recall ≥ 0.90 против разметки ИПС |
+| Regression | снапшоты разбора 500 реальных законопроектов | 0 регрессий в CI |
+
+---
+
+## 6. Анализ воздействия (impact analysis)
+
+Два зеркальных вопроса:
+- **Прямой:** *«Что этот законопроект меняет?»* → `ChangeSet`
+- **Обратный:** *«Что ещё зависит от изменяемого?»* → `BlastRadius`
+
+### 6.1 Прямой: извлечение ChangeSet из законопроекта
+
+Российский законопроект «о внесении изменений» имеет **жёстко регулярную структуру**:
+
+```
+Статья 1
+Внести в Федеральный закон от 27 июля 2006 года N 149-ФЗ «Об информации, …»
+(Собрание законодательства Российской Федерации, 2006, N 31, ст. 3448; …)
+следующие изменения:
+1) в статье 10:
+   а) часть 1 изложить в следующей редакции:
+      «1. …новый текст…»;
+   б) дополнить частью 1.1 следующего содержания:
+      «1.1. …»;
+2) статью 15.1 признать утратившей силу;
+3) в части 3 статьи 15 слова «…» заменить словами «…».
+
+Статья 2
+Настоящий Федеральный закон вступает в силу с 1 сентября 2026 года.
+```
+
+**Грамматика операций изменения:**
+
+```ebnf
+ChangeStatement ::= TargetSpec Operation
+TargetSpec      ::= "в" UnitChain ":"                    (* контекст-заголовок *)
+                  | UnitChain                             (* прямая цель *)
+Operation       ::= "изложить в следующей редакции" ":" QuotedStructure
+                  | "признать утративш" Infl "силу"
+                  | "дополнить" UnitWord Nums "следующего содержания" ":" QuotedStructure
+                  | "дополнить" "словами" QuotedText
+                  | "исключить"
+                  | "слова" QuotedText "заменить словами" QuotedText
+                  | "приостановить действие" ("до" Date)?
+QuotedStructure ::= "«" ... "»"    (* → AKN <quotedStructure> *)
+QuotedText      ::= "«" ... "»"    (* → AKN <quotedText>      *)
+```
+
+> 🔑 **Стековая семантика вложенности.** `1) в статье 10:` открывает контекст; `а) часть 1 …` — цель относительна ему. Разбор ведётся стеком контекстов, ровно как в парсере блочной разметки. Это **не** плоский список. **[U]**
+
+```ts
+export interface ChangeSetItem {
+  /** цель — стабильный wId; unitId может быть null, если акт ещё не в БД */
+  readonly targetWid: string;
+  readonly targetUnitId: NodeId | null;
+  readonly targetActUri: string;
+  readonly operation:
+    | { t: "replace";  newText: string }
+    | { t: "repeal" }
+    | { t: "insert";   kind: UnitKind; num: string; text: string; after: string | null }
+    | { t: "delete" }
+    | { t: "replaceWords"; from: string; to: string }
+    | { t: "appendWords";  text: string }
+    | { t: "suspend";  until: string | null };
+  readonly inForceFrom: string | null;   // из «Статья N. Вступление в силу»
+  readonly sourceSpan: [number, number]; // где в тексте законопроекта
+  readonly confidence: number;
+}
+```
+
+**Материализация в граф:** каждый `ChangeSetItem` → строка в `legal_edge`:
+
+```sql
+INSERT INTO legal.legal_edge
+  (вид, src_kind, src_id, dst_kind, dst_id, вид_изменения, период, payload, уверенность, источник)
+VALUES
+  ('изменяет', 'bill', $bill_id, 'unit', $target_unit_id,
+   $вид_изменения::legal.вид_изменения_t,
+   daterange($in_force_from::date, NULL, '[)'),
+   jsonb_build_object('newText', $new_text, 'sourceSpan', $span),
+   $confidence, 'parser');
+```
+
+### 6.2 Обратный: BlastRadius через рекурсивные CTE
+
+**Уровень 1 — структурные потомки цели** (правя статью, правим все её части и пункты):
+
+```sql
+-- O(1) благодаря closure-таблице
+SELECT u.* FROM legal.unit u
+JOIN legal.unit_closure c ON c.descendant_id = u.id
+WHERE c.ancestor_id = $target_unit_id;
+```
+
+**Уровень 2 — транзитивные входящие ссылки** (кто на нас ссылается, и кто ссылается на них):
+
+```sql
+WITH RECURSIVE dependents AS (
+    -- база: прямые ссылки на цель и на её структурных потомков
+    SELECT e.src_id            AS unit_id,
+           1                   AS depth,
+           ARRAY[e.src_id]     AS path,
+           e.вид               AS via
+    FROM legal.legal_edge e
+    JOIN legal.unit_closure c
+      ON c.descendant_id = e.dst_id
+    WHERE c.ancestor_id = $1::uuid          -- целевая единица
+      AND e.dst_kind = 'unit'
+      AND e.src_kind = 'unit'
+      AND e.вид IN ('ссылается_на','толкует','вводится_в_действие')
+      AND (e.период IS NULL OR e.период @> $2::date)   -- темпоральный срез
+
+  UNION ALL
+
+    -- шаг: кто ссылается на найденных
+    SELECT e.src_id,
+           d.depth + 1,
+           d.path || e.src_id,
+           e.вид
+    FROM dependents d
+    JOIN legal.legal_edge e
+      ON e.dst_kind = 'unit' AND e.dst_id = d.unit_id
+     AND e.src_kind = 'unit'
+    WHERE d.depth < $3::int                  -- ОБЯЗАТЕЛЬНЫЙ предел глубины
+      AND NOT (e.src_id = ANY(d.path))       -- защита от циклов
+      AND e.вид IN ('ссылается_на','толкует')
+      AND (e.период IS NULL OR e.период @> $2::date)
+)
+SELECT DISTINCT ON (d.unit_id)
+       d.unit_id,
+       d.depth,
+       d.via,
+       u.eid,
+       u.вид        AS вид_единицы,
+       u.наименование,
+       a.наименование AS акт,
+       a.номер        AS номер_акта,
+       a.uri          AS акт_uri
+FROM dependents d
+JOIN legal.unit u ON u.id = d.unit_id
+JOIN legal.act  a ON a.id = u.act_id
+ORDER BY d.unit_id, d.depth ASC;   -- кратчайший путь до каждого зависимого
+```
+
+> ⚠️ **`d.depth < $3` и `NOT (… = ANY(d.path))` — не опциональны.** Правовой граф насыщен циклами (взаимные ссылки между кодексами). Без ограничителей запрос не завершится. **[U]**
+
+**Уровень 3 — подзаконные акты, изданные «во исполнение»:**
+
+```sql
+SELECT a2.*
+FROM legal.legal_edge e
+JOIN legal.unit u2 ON u2.id = e.src_id
+JOIN legal.act  a2 ON a2.id = u2.act_id
+WHERE e.вид = 'вводится_в_действие'
+  AND e.dst_kind = 'unit'
+  AND e.dst_id IN (SELECT descendant_id FROM legal.unit_closure WHERE ancestor_id = $1);
+```
+
+**Уровень 4 — конфликтующие законопроекты** (другие проекты в работе, трогающие те же нормы):
+
+```sql
+SELECT DISTINCT b.id, b.sozd_number, b.наименование, b.стадия,
+       count(*) OVER (PARTITION BY b.id) AS пересечений
+FROM legal.legal_edge e
+JOIN legal.bill b ON b.id = e.src_id AND e.src_kind = 'bill'
+WHERE e.вид = 'изменяет'
+  AND e.dst_kind = 'unit'
+  AND e.dst_id IN (
+      SELECT c.descendant_id FROM legal.unit_closure c
+      WHERE c.ancestor_id = ANY($1::uuid[])     -- все цели нашего законопроекта
+  )
+  AND b.id <> $2::uuid                          -- кроме нас самих
+  AND b.стадия NOT IN ('отклонён','снят с рассмотрения','подписан');
+```
+
+**Уровень 5 — ранжирование по значимости.** Не все зависимости равны. Метрика «центральности» нормы:
+
+```sql
+-- Материализованное представление, обновляется по расписанию
+CREATE MATERIALIZED VIEW legal.unit_centrality AS
+SELECT u.id AS unit_id,
+       count(*) FILTER (WHERE e.вид = 'ссылается_на') AS входящих_ссылок,
+       count(DISTINCT u2.act_id)                       AS ссылающихся_актов,
+       count(*) FILTER (WHERE e.вид = 'толкует')       AS толкований
+FROM legal.unit u
+LEFT JOIN legal.legal_edge e ON e.dst_kind = 'unit' AND e.dst_id = u.id
+LEFT JOIN legal.unit u2      ON u2.id = e.src_id
+GROUP BY u.id;
+CREATE UNIQUE INDEX ON legal.unit_centrality (unit_id);
+```
+
+Итоговая оценка риска (эвристика) **[U]**:
+
+```
+risk_score = Σ_по зависимым (  w_depth(depth)
+                             × w_kind(вид_ребра)
+                             × log1p(входящих_ссылок)
+                             × w_operation(вид_изменения) )
+
+w_depth      : 1.0 / 0.5 / 0.2 / 0.05        (глубина 1..4)
+w_kind       : ссылается_на=1.0, толкует=0.7, вводится_в_действие=1.5
+w_operation  : признать утратившим силу=3.0, изложить в новой редакции=2.0,
+               заменить слова=1.0, дополнить=0.5
+```
+
+### 6.3 Собранный отчёт
+
+```ts
+export interface BlastRadiusReport {
+  readonly bill: { id: NodeId; sozdNumber: string; наименование: string };
+  /** §6.1 — что меняется */
+  readonly changes: ChangeSetItem[];
+  /** §6.2 ур.1 — структурно затронутые единицы */
+  readonly directlyAffected: AffectedUnit[];
+  /** §6.2 ур.2 — транзитивно зависящие */
+  readonly dependents: Array<AffectedUnit & { depth: number; via: EdgeKind }>;
+  /** §6.2 ур.3 — подзаконные акты под угрозой */
+  readonly subordinateActs: ActSummary[];
+  /** §6.2 ур.4 — конкурирующие законопроекты */
+  readonly conflictingBills: Array<{ bill: BillSummary; пересечений: number }>;
+  /** §6.2 ур.5 */
+  readonly riskScore: number;
+  /** «сирые» ссылки, которые парсер не разрешил — требуют внимания юриста */
+  readonly unresolved: ParsedReference[];
+  readonly computedAt: string;
+  /** темпоральный срез, на который считали */
+  readonly asOf: string;
+}
+```
+
+### 6.4 Производительность и практика
+
+**[U — оценки, требуют замера на реальных данных]**
+
+| Приём | Зачем |
+|---|---|
+| **Всегда `maxDepth`** (по умолчанию 3) | правовой граф цикличен; без предела — зависание |
+| **Closure table для `содержит`** | «все потомки статьи» — самый частый запрос; рекурсия здесь избыточна |
+| **Рекурсия только для `ссылается_на`** | этот граф разрежен и нерегулярен, closure по нему взорвётся по объёму |
+| **Материализовать `unit_centrality`** | пересчёт по расписанию (ночью), не в реальном времени |
+| **Кэшировать `BlastRadiusReport` в Redis** по ключу `(billId, asOf, maxDepth)` | отчёт стабилен между правками законопроекта |
+| **Темпоральный фильтр `период @> asOf` во ВСЕХ ветках CTE** | иначе смешаются исторические и действующие связи |
+| **Пороговать по `уверенность`** | UI должен отделять «точно» от «вероятно» — юрист обязан видеть разницу |
+| Проверять план через `EXPLAIN (ANALYZE, BUFFERS)` | рекурсивные CTE в PG материализуются; при плохой селективности `edge_in` план деградирует |
+
+### 6.5 Эквивалент на TypeQL 3.x (для справки)
+
+```typeql
+match
+  $bill isa законопроект, has номер_законопроекта "123456-8";
+  подал_поправку (законопроект: $bill, цель: $target);
+  let $dep in зависимые($target);             # рекурсивная функция из §4.2
+  $dep isa структурная_единица, has eid $dep_eid;
+  содержит (контейнер: $rev, элемент: $dep);
+  является_редакцией (редакция: $rev, акт: $dep_act);
+  $dep_act has наименование $dep_act_name, has статус "действует";
+let $refs = число_ссылок($dep);
+sort $refs desc;
+limit 200;
+fetch { "зависимая_единица": $dep_eid, "акт": $dep_act_name, "вес": $refs };
+```
+
+Сравните с §6.2: TypeQL **читается заметно приятнее** — рекурсия спрятана в функцию, нет ручной защиты от циклов. Это честное преимущество TypeDB. Но оно **не перевешивает** рисков §2.3 — и, что важно, **в TypeQL нет встроенного ограничителя глубины**, т.е. защиту от циклов всё равно придётся закладывать в саму функцию. **[U]**
+
+---
+
+## 7. План внедрения
+
+**[U — проектное предложение]**
+
+| Фаза | Работы | Выход |
+|---|---|---|
+| **0. Фундамент** | DDL §4.3 в Supabase-миграциях; RLS-политики; `LegalGraphPort` + `PgLegalGraph` | схема + порт |
+| **1. Загрузка** | Импорт RusLawOD (304 382 акта **[V]**); справочник Классификатора № 511; словарь кодексов | заполненный `act` |
+| **2. Структура** | Парсер структуры актов (статья/часть/пункт) → `unit` + `unit_closure` + `eId`/`wId` | заполненный `unit` |
+| **3. Ссылки** | Парсер §5; distant supervision на `<ref>` RusLawOD; gold-set из gist'а | `legal_edge` вид `ссылается_на` |
+| **4. Редакции** | 🔴 **Отдельная задача:** RusLawOD даёт только первые редакции **[V]**. Нужен другой источник консолидированных текстов | `expression` с реальными периодами |
+| **5. Законопроекты** | Импорт СОЗД; парсер ChangeSet §6.1 | `bill`, `amendment`, рёбра `изменяет` |
+| **6. Impact** | Запросы §6.2; кэш; UI-отчёт | `BlastRadiusReport` |
+| **7. Опционально** | Экспорт в AKN XML (round-trip тест в CI); публикация RU-ELI URI | интероперабельность |
+
+### 🔴 Главный незакрытый риск
+
+**Действующие (консолидированные) редакции НПА.** RusLawOD их **не содержит** — только первоначальные тексты **[V]**. Официальный pravo.gov.ru публикует акты **в графическом виде (TIFF/PDF без текстового слоя)** **[V]**. Консолидированные тексты де-факто есть только у КонсультантПлюс и Гарант — **проприетарных коммерческих систем**.
+
+**Следствие:** либо (а) лицензировать данные у КонсультантПлюс/Гарант, либо (б) **строить консолидацию самостоятельно** — применяя извлечённые `ChangeSet` (§6.1) к первоначальным текстам последовательно по датам. Вариант (б) — это, по сути, реализация «git для законов», и **это ядро ценности продукта**, но и главный технический риск. Вариант (б) технически возможен именно потому, что у нас есть и первоначальные тексты (RusLawOD), и парсер операций изменения. **[U]**
+
+---
+
+## 8. Сводка проверенных версий (на 2026-08-20)
+
+```bash
+# ── TypeDB ─────────────────────────────────────────────
+npm view @typedb/driver-http version   # 3.12.3   ✅ единственный путь для TS+TypeDB3
+npm view typedb-driver version         # 2.29.7   ⚠️ ТОЛЬКО TypeDB 2.x, НЕ 3.x
+docker pull typedb/typedb:3.12.3       # сервер CE, MPL-2.0
+
+# ── Альтернативы ───────────────────────────────────────
+npm view neo4j-driver version          # 6.2.0
+npm view @neo4j/cypher-builder version # 3.3.0
+npm view oxigraph version              # 0.5.9    (RDF/SPARQL, встраиваемый)
+npm view sparqljs version              # 3.7.4
+npm view n3 version                    # 2.2.5
+
+# ── Реляционный путь (рекомендуемый) ───────────────────
+npm view pg version                    # 8.23.0
+npm view kysely version                # 0.29.5
+npm view drizzle-orm version           # 0.45.2
+
+# ── Вспомогательное ────────────────────────────────────
+npm view zod version                   # 4.4.3
+npm view nanoid version                # 6.0.1
+npm view fast-xml-parser version       # 5.11.0   (экспорт/импорт AKN)
+npm view saxes version                 # 6.0.0    (потоковый XML для больших дампов)
+npm view @xmldom/xmldom version        # 0.9.11
+npm view @qdrant/js-client-rest version # 1.19.0
+```
+
+Все значения получены командой `npm view` из публичного реестра npm 2026-08-20. **[V]**
+
+---
+
+## 9. Источники
+
+**TypeDB**
+- TypeDB 2.x → 3.x differences — https://typedb.com/docs/reference/typedb-2-vs-3/diff/
+- TypeDB 3.0 is now live — https://typedb.com/blog/typedb-3-0-is-now-live/
+- Функции в TypeDB 3.0 — https://typedb.com/fundamentals/functions-3-0/
+- Пайплайны в TypeDB 3.0 — https://typedb.com/fundamentals/pipelines-3-0/
+- TypeQL Reference: Fetch stage — https://typedb.com/docs/typeql-reference/pipelines/fetch/
+- TypeQL Reference: writing functions — https://typedb.com/docs/typeql-reference/functions/writing
+- HTTP TypeScript driver API — https://typedb.com/docs/reference/http-drivers/typescript
+- HTTP API Reference — https://typedb.com/docs/reference/http-api
+- Установка Community Edition — https://typedb.com/docs/home/install/ce/
+- Репозиторий и лицензия (MPL-2.0) — https://github.com/typedb/typedb
+- Релизы — https://github.com/typedb/typedb/releases
+- Docker Hub — https://hub.docker.com/u/typedb
+- npm `@typedb/driver-http` — https://www.npmjs.com/package/@typedb/driver-http
+- npm `typedb-driver` (2.x) — https://www.npmjs.com/package/typedb-driver
+- TypeDB (Wikipedia) — https://en.wikipedia.org/wiki/TypeDB
+
+**Альтернативы**
+- Neo4j — https://github.com/neo4j/neo4j ; https://neo4j.com/open-core-and-neo4j/
+- Neo4j (Wikipedia) — https://en.wikipedia.org/wiki/Neo4j
+- Apache AGE — https://age.apache.org/ ; https://github.com/apache/age
+- AGE roadmap / PG17-PG18 — https://github.com/apache/age/discussions/2305
+- Graph Queries in Postgres with Apache AGE — https://www.snowflake.com/en/blog/engineering/graph-queries-postgres-apache-age/
+- Apache AGE vs Neo4j — https://www.puppygraph.com/learn/apache-age-vs-neo4j
+
+**Стандарты правовых документов**
+- Akoma Ntoso v1.0 Part 1: XML Vocabulary — https://docs.oasis-open.org/legaldocml/akn-core/v1.0/os/part1-vocabulary/akn-core-v1.0-os-part1-vocabulary.html
+- Akoma Ntoso XSD — https://docs.oasis-open.org/legaldocml/akn-core/v1.0/os/part2-specs/schemas/akomantoso30.xsd
+- Akoma Ntoso Naming Convention v1.0 — https://docs.oasis-open.org/legaldocml/akn-nc/v1.0/akn-nc-v1.0.html
+- OASIS Akoma Ntoso v1.0 (standard page) — https://www.oasis-open.org/standard/akn-v1-0/
+- OASIS LegalDocML TC — https://www.oasis-open.org/committees/legaldocml/
+- LegalRuleML Core Specification v1.0 — https://docs.oasis-open.org/legalruleml/legalruleml-core-spec/v1.0/legalruleml-core-spec-v1.0.html
+- LegalRuleML OASIS Standard анонс — https://www.oasis-open.org/2021/09/08/legalruleml-core-specification-v1-0-oasis-standard-published/
+- ELI ontology — https://data.europa.eu/eli/ontology
+- ELI — EU Vocabularies — https://op.europa.eu/en/web/eu-vocabularies/eli
+- ELI Technical Implementation Guide — https://op.europa.eu/documents/2050822/2138819/ELI+-+A+Technical+Implementation+Guide.pdf/
+- European Legislation Identifier (Wikipedia) — https://en.wikipedia.org/wiki/European_Legislation_Identifier
+- Temporal FRBR/FRBRoo model for component-level versioning of legal norms — https://arxiv.org/html/2506.07853v1
+- Legal Knowledge Graph Foundations, Part I (LRMoo F1 → schema.org) — https://arxiv.org/pdf/2508.00827
+
+**Российское право и данные**
+- RusLawOD (GitHub) — https://github.com/irlcode/RusLawOD
+- RusLawOD README (RU) — https://github.com/irlcode/RusLawOD/blob/master/README_RUS.md
+- RusLawOD (Hugging Face) — https://huggingface.co/datasets/irlspbru/RusLawOD
+- Saveliev, Kuchakov (2024). The Russian Legislative Corpus — https://arxiv.org/abs/2406.04855 ; https://arxiv.org/html/2406.04855v2
+- Указ Президента РФ от 15.03.2000 № 511 «О классификаторе правовых актов» — https://www.consultant.ru/document/cons_doc_LAW_26510/ ; http://kremlin.ru/acts/bank/15256/print
+- Классификатор правовых актов (структура) — https://classinform.ru/classifikator-pravovykh-aktov.html
+- Концепция развития технологий машиночитаемого права (2021) — https://www.consultant.ru/document/cons_doc_LAW_396491/
+- Минэкономразвития: об утверждении Концепции — https://www.economy.gov.ru/material/news/v_pravitelstve_utverdili_koncepciyu_razvitiya_tehnologiy_mashinochitaemogo_prava.html
+- Машиночитаемое право: правовой вызов современности (НИУ ВШЭ) — https://publications.hse.ru/articles/547512432
+
+**Извлечение ссылок / NLP**
+- natasha/yargy — https://github.com/natasha/yargy
+- natasha/natasha — https://github.com/natasha/natasha
+- Gold-set российских правовых ссылок (gist) — https://gist.github.com/kuk/554499843fb3875ad3861e2b403126cc
+- openlegaldata/legal-reference-extraction — https://github.com/openlegaldata/legal-reference-extraction
+- freelawproject/eyecite — https://github.com/freelawproject/eyecite ; whitepaper: https://free.law/pdf/eyecite-whitepaper.pdf
+- vas3k/python-glr-parser — https://github.com/vas3k/python-glr-parser
