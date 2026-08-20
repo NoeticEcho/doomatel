@@ -5,3 +5,6 @@ export * from './references/dates.js';
 export * from './references/units.js';
 export * from './references/acts.js';
 export * from './references/parser.js';
+export * from './structure/types.js';
+export * from './structure/parser.js';
+export * from './expertise/anticorruption.js';
