@@ -66,28 +66,37 @@ export class AccessService {
     return role;
   }
 
-  /** Полный перечень прав пользователя — используется для фильтрации поиска. */
+  /**
+   * Полный перечень прав пользователя.
+   *
+   * Берётся из тех же функций базы, что использует разграничение доступа
+   * на уровне строк: `visible_project_ids` и `visible_tenant_ids`. Это и есть
+   * тот единственный источник, которым ограничивается выдача векторного
+   * поиска. Считать видимость здесь по собственным правилам нельзя: два
+   * независимых вычисления рано или поздно разойдутся, и расхождение
+   * означало бы утечку материалов между фракциями, которую ничто
+   * не обнаружит.
+   */
   async scope(userId: string): Promise<AccessScope> {
-    const organizations = await this.db.drizzle.execute(
-      sql`select organization_id::text as id from public.user_organization_ids(${userId}::uuid)`,
-    );
-    const organizationIds = (organizations as unknown as Array<{ id: string }>).map(
-      (row) => row.id,
-    );
-
-    const projects = await this.db.drizzle.execute(sql`
-      select p.id::text as id
-      from public.project p
-      where public.project_role(p.id, ${userId}::uuid) is not null
+    const rows = await this.db.drizzle.execute(sql`
+      select
+        public.visible_project_ids(${userId}::uuid) as project_ids,
+        public.visible_tenant_ids(${userId}::uuid) as tenant_ids,
+        (select coalesce(array_agg(organization_id::text), array[]::text[])
+           from public.user_organization_ids(${userId}::uuid)) as organization_ids
     `);
-    const projectIds = (projects as unknown as Array<{ id: string }>).map((row) => row.id);
+
+    const row = (rows as unknown as Array<{
+      project_ids: string[] | null;
+      tenant_ids: string[] | null;
+      organization_ids: string[] | null;
+    }>)[0];
 
     return {
       userId,
-      projectIds,
-      organizationIds,
-      // Публичный корпус доступен всем аутентифицированным пользователям.
-      tenantIds: ['public', ...organizationIds],
+      projectIds: row?.project_ids ?? [],
+      organizationIds: row?.organization_ids ?? [],
+      tenantIds: row?.tenant_ids ?? ['public'],
     };
   }
 }

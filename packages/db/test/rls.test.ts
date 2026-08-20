@@ -290,6 +290,48 @@ describeIfDb('политики RLS', () => {
     expect(rows.map((r) => r['action'])).toContain('project.create');
   });
 
+  it('нельзя узнать роль другого пользователя', async () => {
+    // Функции доступа лежат в схеме public и потому доступны как RPC-методы
+    // PostgREST. Без этой проверки любой депутат мог бы перебором выяснить,
+    // кто в каком чужом проекте участвует.
+    await expect(
+      asUser(
+        actors.viktor,
+        (tx) => tx`select public.project_role(${actors.projectA}, ${actors.alice}) as role`,
+      ),
+    ).rejects.toThrow(/другого пользователя/u);
+  });
+
+  it('о себе спрашивать можно', async () => {
+    const rows = await asUser(
+      actors.alice,
+      (tx) => tx`select public.project_role(${actors.projectA}, ${actors.alice}) as role`,
+    );
+    expect(rows[0]!['role']).toBe('owner');
+  });
+
+  it('перечень видимых проектов совпадает с тем, что отдают политики', async () => {
+    // Инвариант: выдача поиска ограничивается тем же перечнем, что и строки
+    // в базе. Если эти два множества разойдутся, утечка между фракциями
+    // не будет ничем обнаружена.
+    const viaFunction = await asUser(
+      actors.galina,
+      (tx) => tx`select public.visible_project_ids() as ids`,
+    );
+    const viaPolicy = await asUser(actors.galina, (tx) => tx`select id from project`);
+
+    const fromFunction = [...((viaFunction[0]!['ids'] as string[]) ?? [])].sort();
+    const fromPolicy = viaPolicy.map((row) => String(row['id'])).sort();
+    expect(fromFunction).toEqual(fromPolicy);
+  });
+
+  it('перечень арендаторов включает публичный корпус и свои организации', async () => {
+    const rows = await asUser(actors.viktor, (tx) => tx`select public.visible_tenant_ids() as ids`);
+    const tenants = rows[0]!['ids'] as string[];
+    expect(tenants).toContain('public');
+    expect(tenants).toContain(actors.partyB);
+  });
+
   it('нельзя выдать себе доступ к чужому проекту', async () => {
     await expect(
       asUser(
