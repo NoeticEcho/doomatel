@@ -1,0 +1,76 @@
+@import 'tailwindcss';
+
+/*
+ * Оформление рассчитано на длительное чтение правовых текстов:
+ * спокойный фон без чистого белого, увеличенная межстрочная плотность,
+ * шрифт с ясным различением цифр — номера статей и актов читаются постоянно.
+ */
+@theme {
+  --font-sans: 'PT Sans', 'Segoe UI', system-ui, sans-serif;
+  --font-serif: 'PT Serif', Georgia, serif;
+  --font-mono: 'JetBrains Mono', 'SF Mono', ui-monospace, monospace;
+
+  --color-paper: oklch(0.985 0.003 90);
+  --color-ink: oklch(0.22 0.01 260);
+  --color-muted: oklch(0.52 0.015 260);
+  --color-line: oklch(0.9 0.008 260);
+  --color-accent: oklch(0.45 0.13 255);
+  --color-accent-soft: oklch(0.95 0.03 255);
+  --color-warn: oklch(0.62 0.16 55);
+  --color-danger: oklch(0.55 0.19 25);
+  --color-ok: oklch(0.55 0.12 155);
+}
+
+:root {
+  color-scheme: light;
+}
+
+body {
+  background: var(--color-paper);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Текст нормативного документа: читается как документ, а не как интерфейс. */
+.legal-prose {
+  font-family: var(--font-serif);
+  font-size: 1.0625rem;
+  line-height: 1.7;
+  hyphens: auto;
+}
+
+.legal-prose .article-heading {
+  font-weight: 700;
+  margin-block: 1.5rem 0.5rem;
+}
+
+.legal-prose .clause {
+  margin-block: 0.5rem;
+  padding-inline-start: 1.25rem;
+  text-indent: -1.25rem;
+}
+
+/* Цитата нормы в ответе помощника — визуально отделена от рассуждения. */
+.citation {
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  color: var(--color-accent);
+}
+
+/* Предложенная правка: видно, что это предложение, а не изменение. */
+.suggestion-insert {
+  background: color-mix(in oklch, var(--color-ok) 15%, transparent);
+  text-decoration: underline;
+  text-decoration-style: dotted;
+}
+
+.suggestion-delete {
+  background: color-mix(in oklch, var(--color-danger) 12%, transparent);
+  text-decoration: line-through;
+}
+
+@media print {
+  .no-print { display: none !important; }
+  .legal-prose { font-size: 12pt; }
+}

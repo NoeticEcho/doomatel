@@ -8,3 +8,4 @@ export * from './references/parser.js';
 export * from './structure/types.js';
 export * from './structure/parser.js';
 export * from './expertise/anticorruption.js';
+export * from './structure/numbering.js';
