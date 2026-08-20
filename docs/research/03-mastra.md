@@ -1573,7 +1573,7 @@ export const outputGuardrails = createWorkflow({
 | 4 | **`@mastra/nestjs` 0.2.17 при core 1.60.** Catch-all `@All('*')`, Express-only. | 🟡 средняя | Не встраивать (§7.4). |
 | 5 | **Вес.** `@mastra/core` tarball 13.8 MB. | 🟡 средняя | Отдельный сервис ⇒ не влияет на Next.js бандл. `mastra build` делает tree-shaken Hono-бандл. |
 | 6 | **Observability tooling — early-stage** относительно специализированных eval-фреймворков. | 🟡 средняя | Экспортировать в OTel (`@mastra/otel-exporter`) → свой Grafana/Tempo. Не полагаться на Mastra Cloud. |
-| 7 | **Vendor concentration.** Один стартап, VC-финансирование. Что если? | 🟡 средняя | Apache/MIT + open source. **[UNVERIFIED — лицензию не подтвердил, GitHub API заблокирован из песочницы; ПРОВЕРИТЬ.]** Вся бизнес-логика (парсеры СОЗД, юр-тех линтер, онтология) — в наших пакетах, не в Mastra-специфичном коде. |
+| 7 | **Vendor concentration.** Один стартап, VC-финансирование. Что если? | 🟢 низкая | **Лицензия `Apache-2.0`** у всех пакетов (`npm view @mastra/core license`) **[V-npm]**, репозиторий `github.com/mastra-ai/mastra`. Даже при уходе вендора можно форкнуть. Вся бизнес-логика (парсеры СОЗД, юр-тех линтер, онтология) — в наших пакетах, не в Mastra-специфичном коде. |
 | 8 | **Tool-calling на российских моделях** (§8.6). | 🔴 высокая | Бенчмарк ДО фиксации стека. `jsonPromptInjection: 'auto'` + `@mastra/schema-compat`. |
 | 9 | **Нет `@mastra/milvus`.** | 🟢 низкая | Qdrant / pgvector. |
 | 10 | **Нет интеграции с TypeDB.** GraphRAG у Mastra — по эмбеддингам, не по онтологии. | 🟡 средняя | Обернуть TypeDB своим `createTool` — это тривиально и это правильный слой абстракции. |
@@ -1610,7 +1610,7 @@ export const outputGuardrails = createWorkflow({
 
 ## 12. Немедленные проверки перед фиксацией стека
 
-- [ ] **Лицензия Mastra** — подтвердить (GitHub API был недоступен). Блокер для госзакупки.
+- [x] ~~**Лицензия Mastra**~~ — **подтверждено: `Apache-2.0`** для `mastra`, `@mastra/core`, `@mastra/rag`, `@mastra/qdrant`, `@mastra/pg`, `@mastra/mcp`, `@mastra/memory`, `@mastra/ai-sdk`, `@mastra/nestjs`. Пригодно для госзакупки; требуется сохранение NOTICE.
 - [ ] **Tool-calling бенчмарк** GigaChat / YandexGPT / vLLM+Qwen3: `.network()` с 4 sub-агентами, доля успешных делегирований, поддержка `response_format: json_schema`.
 - [ ] **`ChunkParams`** — точные имена полей (`maxSize`? `size`?) в `dist/document/types.d.ts`.
 - [ ] **`createRun()` vs `createRunAsync()`** в 1.60.
